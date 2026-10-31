@@ -17,11 +17,19 @@
 
 ## 安装
 
-### 从 GitHub 安装
+### 下载发布版安装包（推荐）
 
-1. 在电脑上打开本仓库：[iamzhangjinpeng/danxiangli.koplugin](https://github.com/iamzhangjinpeng/danxiangli.koplugin)，下载仓库 ZIP 并解压。
-2. 将插件文件夹命名为 `danxiangli.koplugin`。确认 `main.lua` 和 `_meta.lua` 直接位于这个文件夹内，不要多套一层同名目录。
-3. 用 USB 将 Kindle 连接到电脑，把整个 `danxiangli.koplugin` 文件夹复制到 Kindle 的：
+1. 打开 [最新发布版](https://github.com/iamzhangjinpeng/danxiangli.koplugin/releases/latest)，在 **Assets（附件）** 中下载 `danxiangli.koplugin-v版本号.zip` 安装包。
+2. 解压后会直接得到 `danxiangli.koplugin` 文件夹，无需改名。安装包只包含运行文件和使用说明，目录结构如下：
+
+   ```text
+   danxiangli.koplugin/
+   ├── main.lua
+   ├── _meta.lua
+   └── README.md
+   ```
+
+3. 用 USB 将 Kindle 连接到电脑，把整个 `danxiangli.koplugin` 文件夹复制到 Kindle 盘中的 `koreader/plugins/` 下。设备上的完整路径是：
 
    ```text
    /mnt/us/koreader/plugins/danxiangli.koplugin/
@@ -29,6 +37,12 @@
 
 4. 安全弹出 Kindle，然后完全退出并重新打开 KOReader。
 5. 打开 KOReader 的“工具”菜单，找到“单向历”。如果菜单没有出现，确认插件目录层级正确，并检查 KOReader 的插件管理中该插件是否已启用。
+
+请下载上面命名的安装包；GitHub 自动提供的 **Source code (zip)** 和 **Source code (tar.gz)** 是源码归档。若使用源码归档安装，需要手动将解压后的文件夹改名为 `danxiangli.koplugin`，确保 `main.lua` 和 `_meta.lua` 直接位于其中。
+
+### 更新已有插件
+
+完全退出 KOReader，再用新版安装包中的 `danxiangli.koplugin` 文件夹覆盖旧插件目录，安全弹出 Kindle 后重新打开 KOReader。更新会保留已有图片和 KOReader 中的插件设置。
 
 KOReader 的插件目录通常位于 KOReader 安装目录下的 `plugins/` 文件夹。Kindle 上本插件使用上面的 `/mnt/us/koreader/plugins/` 路径。其他平台的安装说明可参照 [KOReader 用户指南](https://koreader.rocks/user_guide/)。
 
