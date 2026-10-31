@@ -1,7 +1,7 @@
 -- Run from the plugin directory: lua tests/download_spec.lua /path/to/empty/scratch-dir
 -- Public-entry-point regression checks with virtual child processes and time.
 -- IO uses temporary files; no requests are sent and no Kindle files are changed.
-local real_open, real_time = io.open, os.time
+local real_open, real_time, real_rename = io.open, os.time, os.rename
 local main_path = (arg and arg[2]) or "main.lua"
 local tmp_root = assert(arg and arg[1], "Provide an existing scratch directory as the first argument")
 local input = assert(real_open(main_path, "rb"))
@@ -19,24 +19,28 @@ local function fixture(options)
     fixture_count = fixture_count + 1
     local base = tmp_root .. "/case-" .. fixture_count
     local f = { now = 0, queue = {}, jobs = {}, instances = {}, count = 0, locks = 0,
-        closes = 0, reads = 0, requests = 0, prefix = base .. "-", options = options }
+        closes = 0, reads = 0, requests = 0, files = {}, messages = {}, prefix = base .. "-", options = options }
     os.time = function(t) return t and real_time(t) or epoch + math.floor(f.now) + (f.wall_shift or 0) end
-    local function path(suffix) return f.prefix .. os.date("!%Y%m%d", os.time() + 8 * 3600) .. suffix end
-    function f:read(suffix)
-        local h = real_open(path(suffix or ".jpg"), "rb")
+    local function today_name(suffix) return os.date("!%Y%m%d", os.time() + 8 * 3600) .. (suffix or ".jpg") end
+    function f:read_named(name)
+        local h = real_open(self.prefix .. name, "rb")
         if not h then return nil end
         local body = h:read("*a")
         h:close()
         return body
     end
-    function f:write(body, suffix)
-        local h = assert(real_open(path(suffix or ".jpg"), "wb"))
+    function f:read(suffix) return self:read_named(today_name(suffix)) end
+    function f:write_named(name, body)
+        local h = assert(real_open(self.prefix .. name, "wb"))
         h:write(body)
         h:close()
+        self.files[name] = true
     end
+    function f:write(body, suffix) self:write_named(today_name(suffix), body) end
     io.open = function(name, mode)
         local h, err = real_open(name, mode)
         if not h or mode ~= "wb" or not name:find(f.prefix, 1, true) then return h, err end
+        f.files[name:sub(#f.prefix + 1)] = true
         return {
             write = function(_, chunk)
                 if f.options.write_fail then return nil, "disk full" end
@@ -50,6 +54,14 @@ local function fixture(options)
             end,
         }
     end
+    os.rename = function(from, to)
+        local ok, err = real_rename(from, to)
+        if ok and from:find(f.prefix, 1, true) and to:find(f.prefix, 1, true) then
+            f.files[from:sub(#f.prefix + 1)] = nil
+            f.files[to:sub(#f.prefix + 1)] = true
+        end
+        return ok, err
+    end
     local ui = {}
     function ui:scheduleIn(delay, cb)
         table.insert(f.queue, { at = f.now + delay, cb = cb })
@@ -62,7 +74,7 @@ local function fixture(options)
     end
     function ui:preventStandby() f.locks = f.locks + 1 end
     function ui:allowStandby() f.locks = f.locks - 1; assert(f.locks >= 0) end
-    function ui:show() end
+    function ui:show(message) table.insert(f.messages, message.text) end
     function f:advance(seconds)
         local target, steps = self.now + seconds, 0
         while self.queue[1] and self.queue[1].at <= target + 0.000001 do
@@ -159,7 +171,21 @@ local function fixture(options)
         ["ui/time"] = { to_s = function(v) return v end, boottime_or_monotonic = function() return f.now end },
         ["ui/network/manager"] = { isConnected = function() return true end, isWifiOn = function() return true end },
         ["gettext"] = function(v) return v end,
-        ["libs/libkoreader-lfs"] = { dir = function() return function() end end },
+        ["libs/libkoreader-lfs"] = {
+            dir = function(path)
+                eq(path, f.prefix, "scan stays inside plugin directory")
+                local names = {}
+                for name in pairs(f.files) do names[#names + 1] = name end
+                local i = 0
+                return function() i = i + 1; return names[i] end
+            end,
+            attributes = function(path, attr)
+                eq(attr, "mode")
+                if path == f.prefix then return "directory" end
+                local h = real_open(path, "rb")
+                if h then h:close(); return "file" end
+            end,
+        },
     }
     for name, module in pairs(modules) do package.loaded[name] = module end
     local code = source:gsub('local SAVE_DIR = "[^"]+"', 'local SAVE_DIR = ' .. string.format("%q", f.prefix))
@@ -176,16 +202,19 @@ local function fixture(options)
         self:advance(0.25)
         eq(#self.queue, 0, "timer cleanup")
         eq(self.locks, 0, "standby lock cleanup")
-        os.remove(path(".jpg"))
-        os.remove(path(".jpg.tmp"))
-        io.open, os.time = real_open, real_time
+        for name in pairs(self.files) do os.remove(self.prefix .. name) end
+        io.open, os.time, os.rename = real_open, real_time, real_rename
     end
+    for name, body in pairs(options.files or {}) do f:write_named(name, body) end
+    if options.today_image then f:write(options.today_image) end
     f.instance = f:new_instance()
     return f
 end
 
+local test_count = 0
 local function test(name, body)
     body()
+    test_count = test_count + 1
     print("PASS " .. name)
 end
 
@@ -204,7 +233,7 @@ test("HTTP 200 succeeds, closes once, and skips repeat downloads", function()
     f:cleanup()
 end)
 
-test("404 enters cooldown and force download bypasses it", function()
+test("404 enters cooldown and manual download bypasses it", function()
     local f = fixture({ responses = { { code = 404 }, { code = 200 } } })
     f.instance:_run()
     f:complete(1)
@@ -214,7 +243,7 @@ test("404 enters cooldown and force download bypasses it", function()
     eq(f:read(".jpg.tmp"), nil)
     f.instance:_run()
     eq(f.count, 1)
-    f.instance:force_redownload()
+    f.instance:download_today()
     eq(f.count, 2)
     f:complete(2)
     f:advance(0.125)
@@ -224,8 +253,8 @@ end)
 
 test("hard deadline kills worker; lock and old image survive until reaped", function()
     local f = fixture({ delay_kill = true })
-    f:write(jpeg)
-    f.instance:force_redownload()
+    f:write_named("20000101.jpg", jpeg)
+    f.instance:download_today()
     f:write("partial", ".jpg.tmp")
     f:advance(19.875)
     assert(not f.jobs[1].killed)
@@ -233,14 +262,14 @@ test("hard deadline kills worker; lock and old image survive until reaped", func
     assert(f.jobs[1].killed)
     eq(f.reads, 0)
     assert(f.instance._busy)
-    f.instance:force_redownload()
+    f.instance:download_today()
     eq(f.count, 1)
     f.jobs[1].done = true
     f:advance(0.125)
     eq(f.instance._last_status, "timeout")
     assert(not f.instance._busy)
     assert(f.instance._retry_at)
-    eq(f:read(), jpeg)
+    eq(f:read_named("20000101.jpg"), jpeg)
     eq(f:read(".jpg.tmp"), nil)
     eq(f.locks, 0)
     f:cleanup()
@@ -292,17 +321,17 @@ test("cancellation retries when initial kill races child startup", function()
     f:cleanup()
 end)
 
-test("late old success cannot replace existing image after UI transition", function()
+test("late old success cannot replace current file after UI transition", function()
     local f = fixture()
-    local old_image = "\255\216" .. string.rep("o", 2048) .. "\255\217"
+    local old_image = "previous incomplete image"
     f:write(old_image)
-    f.instance:force_redownload()
+    f.instance:download_today()
     f:complete(1)
     local current = f:new_instance()
     f:advance(0.125)
     eq(f:read(), old_image)
     eq(f:read(".jpg.tmp"), nil)
-    current:force_redownload()
+    current:download_today()
     f:complete(2)
     f:advance(0.125)
     eq(f:read(), jpeg)
@@ -327,15 +356,18 @@ for _, case in ipairs({
     { name = "write failure", options = { write_fail = true }, status = "open_error" },
     { name = "close failure", options = { close_fail = true }, status = "open_error" },
 }) do
-    test(case.name .. " preserves previous image", function()
+    test(case.name .. " preserves previous files", function()
         local f = fixture(case.options)
-        f:write(jpeg)
-        f.instance:force_redownload()
+        local old_image = "previous incomplete image"
+        f:write(old_image)
+        f:write_named("20000101.jpg", jpeg)
+        f.instance:download_today()
         f:complete(1)
         f:advance(0.125)
         eq(f.instance._last_status, case.status)
         eq(f.closes, 1)
-        eq(f:read(), jpeg)
+        eq(f:read(), old_image)
+        eq(f:read_named("20000101.jpg"), jpeg)
         eq(f:read(".jpg.tmp"), nil)
         f:cleanup()
     end)
@@ -362,4 +394,102 @@ test("startup failure across date change keeps replacement worker cancellable", 
     f:cleanup()
 end)
 
-print("All 14 regression checks passed")
+test("one manual menu entry reuses valid current image", function()
+    local f = fixture({ today_image = jpeg })
+    local items = {}
+    f.instance:addToMainMenu(items)
+    eq(#items.danxiangli.sub_item_table, 3)
+    eq(items.danxiangli.sub_item_table[2].text, "下载今日单向历")
+    items.danxiangli.sub_item_table[2].callback()
+    eq(f.count, 0)
+    eq(f.messages[#f.messages], "今日单向历已存在")
+    eq(f:read(), jpeg)
+    eq(f.instance.force_redownload, nil)
+    f:cleanup()
+end)
+
+test("manual retry bypasses cooldown while automatic checks respect it", function()
+    local f = fixture({ responses = { { code = 404 }, { error = "connect failed" }, { code = 200 } } })
+    f:write_named("20000101.jpg", jpeg)
+    f.instance:_run()
+    f:complete(1)
+    f:advance(0.125)
+    eq(f:read_named("20000101.jpg"), jpeg)
+    f.instance:download_today()
+    f:complete(2)
+    f:advance(0.125)
+    assert(f.instance._retry_at)
+    f.instance:_run()
+    eq(f.count, 2, "automatic check stays in cooldown")
+    assert(f.instance._retry_at, "automatic check preserves manual retry")
+    f:advance(10)
+    eq(f.count, 3, "manual retry bypasses earlier 404 cooldown")
+    f:complete(3)
+    f:advance(0.125)
+    eq(f.instance._last_status, "ok")
+    eq(f:read(), jpeg)
+    eq(f:read_named("20000101.jpg"), nil)
+    f:cleanup()
+end)
+
+test("retry stops when a valid current image becomes available", function()
+    local f = fixture({ responses = { { error = "connect failed" } } })
+    f.instance:download_today()
+    f:complete(1)
+    f:advance(0.125)
+    f:write(jpeg)
+    f:advance(10)
+    eq(f.count, 1)
+    eq(f.instance._retry_at, nil)
+    f:cleanup()
+end)
+
+test("startup removes only dated temporary files even with current image ready", function()
+    local f = fixture({ today_image = jpeg, files = {
+        ["20000101.jpg.tmp"] = "interrupted download",
+        ["20000102.jpg.tmp"] = "another interrupted download",
+        ["20000101.jpg"] = jpeg,
+        ["notes.tmp"] = "keep",
+        ["20000101.jpg.tmp.backup"] = "keep",
+        ["123.jpg.tmp"] = "keep",
+    } })
+    eq(f:read_named("20000101.jpg.tmp"), nil)
+    eq(f:read_named("20000102.jpg.tmp"), nil)
+    eq(f:read_named("20000101.jpg"), jpeg)
+    eq(f:read_named("notes.tmp"), "keep")
+    eq(f:read_named("20000101.jpg.tmp.backup"), "keep")
+    eq(f:read_named("123.jpg.tmp"), "keep")
+    eq(f:read(), jpeg)
+    f:advance(8)
+    eq(f.count, 0)
+    f:cleanup()
+end)
+
+test("startup also removes leftovers when today's image is missing", function()
+    local f = fixture({ files = { ["20000101.jpg.tmp"] = "interrupted download" } })
+    eq(f:read_named("20000101.jpg.tmp"), nil)
+    f:advance(8)
+    eq(f.count, 1)
+    f:complete(1)
+    f:advance(0.125)
+    eq(f:read(), jpeg)
+    f:cleanup()
+end)
+
+test("UI transition defers temporary-file cleanup until old writer exits", function()
+    local f = fixture({ delay_kill = true })
+    f.instance:download_today()
+    f:write("active partial image", ".jpg.tmp")
+    f:write_named("20000101.jpg.tmp", "stale")
+    f:new_instance()
+    eq(f:read(".jpg.tmp"), "active partial image")
+    eq(f:read_named("20000101.jpg.tmp"), "stale")
+    eq(f.reads, 0)
+    f.jobs[1].done = true
+    f:advance(0.125)
+    eq(f:read(".jpg.tmp"), nil)
+    eq(f:read_named("20000101.jpg.tmp"), nil)
+    f:cleanup()
+end)
+
+print("All " .. test_count .. " regression checks passed")

@@ -81,7 +81,7 @@ local function queue_download_check(opts)
     if opts then
         pending_download_opts = pending_download_opts or {}
         pending_download_opts.notify = pending_download_opts.notify or opts.notify
-        pending_download_opts.force = pending_download_opts.force or opts.force
+        pending_download_opts.ignore_cooldown = pending_download_opts.ignore_cooldown or opts.ignore_cooldown
     end
 end
 
@@ -154,6 +154,21 @@ local function cleanup_old_images(keep_date_str)
     end)
     if removed > 0 then
         logger.info("单向历: 清理旧图", removed, "张")
+    end
+end
+
+-- A previous KOReader process may have exited before its cleanup callback ran.
+-- Never scan/delete temporary files while any downloader can still write them.
+local function cleanup_temporary_files()
+    if active_worker or not has_lfs or lfs.attributes(SAVE_DIR, "mode") ~= "directory" then return end
+    for name in lfs.dir(SAVE_DIR) do
+        if name:match("^%d%d%d%d%d%d%d%d%.jpg%.tmp$") then
+            local path = SAVE_DIR .. name
+            if lfs.attributes(path, "mode") == "file" then
+                local ok, err = os.remove(path)
+                if not ok then logger.warn("单向历: 清理临时文件失败", path, tostring(err)) end
+            end
+        end
     end
 end
 
@@ -275,6 +290,7 @@ local function run_request_in_subprocess(task, callback)
             status = self.stop_status
         end
         callback(status)
+        cleanup_temporary_files()
     end
 
     active_worker = worker
@@ -440,6 +456,7 @@ function DanXiangLi:init()
     self._last_status = nil
 
     util.makePath(SAVE_DIR)
+    cleanup_temporary_files()
     if is_auto_screensaver_enabled() then
         self:_ensure_screensaver_settings()
     else
@@ -762,7 +779,7 @@ end
 function DanXiangLi:_retry_round(attempt, opts)
     if self._stopped or self._busy then return end
     local t, today_str, today_path = get_today_info()
-    if not (opts and opts.force) and is_http404_cooling(today_str) then return end
+    if not (opts and opts.ignore_cooldown) and is_http404_cooling(today_str) then return end
     if is_valid_jpeg(today_path) then
         cleanup_old_images(today_str)
         self:_cancel_retry()
@@ -794,9 +811,8 @@ function DanXiangLi:_run(opts)
     util.makePath(SAVE_DIR)
     local t, today_str, today_path = get_today_info()
 
-    -- 快速路径：今日图已就绪，只需清理旧图。
-    -- 强制重下载时保留旧图，直到新图下载并校验成功后再替换。
-    if not (opts and opts.force) and is_valid_jpeg(today_path) then
+    -- 自动和手动下载均复用有效今日图，避免不必要的重复请求。
+    if is_valid_jpeg(today_path) then
         self:_cancel_retry()
         cleanup_old_images(today_str)
         if opts and opts.notify then
@@ -806,7 +822,7 @@ function DanXiangLi:_run(opts)
     end
 
     -- 今日图确认未发布后，冷却期内不再打服务器。
-    if not (opts and opts.force) and is_http404_cooling(today_str) then
+    if not (opts and opts.ignore_cooldown) and is_http404_cooling(today_str) then
         logger.dbg("单向历: 今日图未发布，冷却中，跳过")
         return
     end
@@ -826,16 +842,10 @@ function DanXiangLi:_run(opts)
     self:_download_today(t, today_str, opts, 0, true)
 end
 
-function DanXiangLi:force_redownload()
+function DanXiangLi:download_today()
     if self._stopped then return end
-    if self._busy then
-        UIManager:show(InfoMessage:new{ text = gettext("单向历任务进行中…"), timeout = 2 })
-        return
-    end
     self:_cancel_retry()
-    http404_cooldown_date = nil
-    http404_cooldown_until = nil
-    self:_run{ notify = true, force = true }
+    self:_run{ notify = true, ignore_cooldown = true }
 end
 
 ----------------------------------------------------------------------
@@ -897,11 +907,7 @@ function DanXiangLi:addToMainMenu(menu_items)
             },
             {
                 text = gettext("下载今日单向历"),
-                callback = function() self:_run{ notify = true } end,
-            },
-            {
-                text = gettext("强制重新下载今日"),
-                callback = function() self:force_redownload() end,
+                callback = function() self:download_today() end,
             },
             {
                 text = gettext("诊断"),
