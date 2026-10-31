@@ -1,7 +1,7 @@
 --[[
 单向历 (DanXiangLi) — KOReader 插件
 - 每日下载单向历（OWSPACE）当日壁纸，并自动接管 KOReader 锁屏屏保。
-- 下载使用异步请求，网络等待期间不阻塞 KOReader 界面。
+- 下载在后台子进程执行，网络等待期间不阻塞 KOReader 界面。
 - 安装即自动配置屏保（随机图模式 + 专用目录 + 拉伸填充，避免两侧黑边）。
 - 唤醒后自动更新；Wi-Fi 重连期间退避重试，连上立即下载。
 - 仅保留当日图片，旧图自动清理。
@@ -12,7 +12,10 @@ local UIManager       = require("ui/uimanager")
 local InfoMessage     = require("ui/widget/infomessage")
 local logger          = require("logger")
 local util            = require("util")
-local HTTPClient      = require("httpclient")
+local http            = require("socket.http")
+local socketutil      = require("socketutil")
+local ffiutil         = require("ffi/util")
+local time            = require("ui/time")
 local NetworkMgr      = require("ui/network/manager")
 local gettext         = require("gettext")
 
@@ -24,6 +27,9 @@ end
 local DanXiangLi = WidgetContainer:extend{ name = "danxiangli" }
 local active_instance
 local active_download
+local active_worker
+local scheduler_callback
+local schedule_next_check
 local pending_download_check = false
 local pending_download_opts
 local http404_cooldown_date
@@ -41,6 +47,8 @@ local CHECK_INTERVAL   = 5 * 60   -- 周期兜底检查（秒）
 local MAX_RETRIES      = 6        -- Wi-Fi 重连等待的最大轮数
 local RETRY_BASE       = 10       -- 退避基数（秒）
 local RETRY_MAX        = 120      -- 单次退避上限（秒）
+local HTTP_TIMEOUT     = 20       -- 下载总时限（秒），由父进程强制执行
+local WORKER_POLL_INTERVAL = 0.125
 local HTTP404_COOLDOWN = 2 * 3600 -- 今日图未发布 (404) 后的冷却（秒）
 local MIN_JPEG_SIZE    = 1024
 
@@ -176,6 +184,7 @@ local function status_text(status)
     elseif status == "no_network" then return gettext("无网络连接")
     elseif status == "open_error" then return gettext("无法创建文件（权限或空间不足）")
     elseif status == "network_error" then return gettext("网络请求失败")
+    elseif status == "timeout" then return gettext("下载超时")
     elseif status == "invalid_file" then return gettext("下载文件校验失败")
     elseif status == "rename_error" then return gettext("文件替换失败")
     elseif type(status) == "string" and status:match("^http_") then
@@ -185,8 +194,94 @@ local function status_text(status)
 end
 
 ----------------------------------------------------------------------
--- 下载（异步请求，tmp + 校验 + 替换）
+-- 下载（后台子进程，tmp + 校验 + 替换）
 ----------------------------------------------------------------------
+
+-- BOOTTIME includes time spent asleep, and is unaffected by clock changes.
+local function worker_now()
+    return time.to_s(time.boottime_or_monotonic())
+end
+
+-- Keep the worker alive only until its deadline or cancellation. Reaping is
+-- nonblocking; the same scheduler services both the worker and normal checks.
+local function run_request_in_subprocess(task, callback)
+    local pid, read_fd
+    local started, start_err = pcall(function()
+        pid, read_fd = ffiutil.runInSubProcess(function(_, child_write_fd)
+            local ok, status = pcall(task)
+            if not ok then
+                logger.warn("单向历: 子进程请求异常", tostring(status))
+                status = "network_error"
+            end
+            if type(status) ~= "string" then
+                status = "network_error"
+            end
+            ffiutil.writeToFD(child_write_fd, status, true)
+        end, true)
+    end)
+    if not started or not pid then
+        -- On failure the second return value is an error string, not an fd.
+        logger.warn("单向历: 无法启动下载子进程", tostring(start_err or read_fd))
+        callback("network_error")
+        return nil
+    end
+
+    local now = worker_now()
+    local worker = {
+        pid = pid,
+        read_fd = read_fd,
+        deadline = now + HTTP_TIMEOUT,
+        poll_at = now + WORKER_POLL_INTERVAL,
+    }
+
+    function worker:cancel(status)
+        if self.completed or self.stop_status then return end
+        self.stop_status = status or "stale_request"
+        ffiutil.terminateSubProcess(self.pid)
+        self.poll_at = worker_now() + WORKER_POLL_INTERVAL
+        schedule_next_check()
+    end
+
+    function worker:poll()
+        if self.completed then return end
+        if not ffiutil.isSubProcessDone(self.pid) then
+            if self.stop_status then
+                -- Cancellation may race the child's initial setpgid(). Retry
+                -- the nonblocking kill until its process group exists/exits.
+                ffiutil.terminateSubProcess(self.pid)
+            elseif worker_now() >= self.deadline then
+                logger.warn("单向历: 下载超过总时限，终止子进程")
+                self:cancel("timeout")
+            end
+            self.poll_at = worker_now() + WORKER_POLL_INTERVAL
+            return
+        end
+
+        -- Read only after waitpid confirms exit, so this cannot wait on the
+        -- still-running downloader. Release the request lock in the callback
+        -- only after the old writer has gone away.
+        self.completed = true
+        active_worker = nil
+        local read_ok, status = pcall(ffiutil.readAllFromFD, self.read_fd)
+        self.read_fd = nil
+        UIManager:allowStandby()
+        if not read_ok or type(status) ~= "string" or status == "" then
+            logger.warn("单向历: 无法读取下载子进程结果", tostring(status))
+            status = "network_error"
+        end
+        -- Preserve a completed 404 across UI transitions, even if cancellation
+        -- arrived just after the child wrote its result.
+        if self.stop_status and not (self.stop_status == "stale_request" and status == "http_404") then
+            status = self.stop_status
+        end
+        callback(status)
+    end
+
+    active_worker = worker
+    UIManager:preventStandby()
+    schedule_next_check()
+    return worker
+end
 
 local function download_image(year, month, day, date_str, is_active, callback)
     local url = build_url(year, month, day)
@@ -203,64 +298,29 @@ local function download_image(year, month, day, date_str, is_active, callback)
         callback(success, status)
     end
 
-    local function process_response(response)
+    local function process_result(status)
         if completed then return end
         if not is_active() then
             -- A 404 still applies to the current date even if its original UI
             -- instance was replaced while the request was in flight.
             local _, current_date = get_today_info()
-            if current_date == date_str and response and response.code == 404 then
+            if current_date == date_str and status == "http_404" then
                 finish(false, "http_404")
             else
+                os.remove(tmp)
                 finish(false, "stale_request")
             end
             return
         end
         local _, current_date = get_today_info()
         if current_date ~= date_str then
+            os.remove(tmp)
             finish(false, "stale_date")
             return
         end
-        if not response then
-            logger.warn("单向历: 网络请求没有响应")
-            finish(false, "network_error")
-            return
-        end
-        if response.error then
-            logger.warn("单向历: 网络错误", tostring(response.error.message or response.error))
-            finish(false, "network_error")
-            return
-        end
-        if response.code ~= 200 then
-            logger.warn("单向历: HTTP", tostring(response.code))
-            finish(false, "http_" .. tostring(response.code or "unknown"))
-            return
-        end
-        if type(response.body) ~= "string" then
-            logger.warn("单向历: 响应内容为空")
-            finish(false, "invalid_file")
-            return
-        end
-
-        local file, err = io.open(tmp, "wb")
-        if not file then
-            logger.warn("单向历: 无法创建临时文件", tostring(err))
-            finish(false, "open_error")
-            return
-        end
-
-        local write_ok, wrote, write_err = pcall(function()
-            return file:write(response.body)
-        end)
-        local close_ok, closed, close_err = pcall(function()
-            return file:close()
-        end)
-        if not write_ok or not wrote or not close_ok or not closed then
-            if not write_ok then write_err = wrote end
-            if not close_ok then close_err = closed end
-            logger.warn("单向历: 写入临时文件失败", tostring(write_err or close_err))
+        if status ~= "downloaded" then
             os.remove(tmp)
-            finish(false, "open_error")
+            finish(false, status or "network_error")
             return
         end
 
@@ -292,29 +352,75 @@ local function download_image(year, month, day, date_str, is_active, callback)
         finish(true, "ok")
     end
 
-    local function on_response(response)
-        if completed then return end
-        local ok, err = pcall(process_response, response)
+    local function request_to_tmp()
+        local file, err = io.open(tmp, "wb")
+        if not file then
+            logger.warn("单向历: 无法创建临时文件", tostring(err))
+            return "open_error"
+        end
+
+        local write_error
+        -- This sink never closes the file; request_to_tmp owns its one close.
+        local function sink(chunk, err)
+            if err then return nil, err end
+            if chunk then
+                local write_ok, wrote, write_err = pcall(file.write, file, chunk)
+                if not write_ok then write_err = wrote end
+                if not write_ok or not wrote then
+                    write_error = write_err or "write failed"
+                    return nil, write_error
+                end
+            end
+            return 1
+        end
+
+        local request_ok, ok, code = pcall(function()
+            -- These changes affect the forked child only. LuaSocket ignores
+            -- request.timeout; socketutil configures both HTTP and HTTPS.
+            socketutil:set_timeout(HTTP_TIMEOUT, HTTP_TIMEOUT)
+            return http.request{
+                url = url,
+                headers = {
+                    ["Referer"] = "https://img.owspace.com/",
+                    ["User-Agent"] = "Mozilla/5.0 (compatible; KOReader)",
+                },
+                sink = sink,
+                redirect = true,
+            }
+        end)
+        local close_ok, closed, close_err = pcall(file.close, file)
+        if not close_ok then close_err = closed end
+        if write_error or not close_ok or not closed then
+            logger.warn("单向历: 写入或关闭临时文件失败", tostring(write_error or close_err))
+            os.remove(tmp)
+            return "open_error"
+        end
+        if not request_ok then
+            logger.warn("单向历: 网络请求异常", tostring(ok))
+            os.remove(tmp)
+            return "network_error"
+        end
         if not ok then
-            logger.warn("单向历: 处理响应失败", tostring(err))
+            logger.warn("单向历: 网络错误", tostring(code))
+            os.remove(tmp)
+            return "network_error"
+        end
+        if code ~= 200 then
+            logger.warn("单向历: HTTP", tostring(code))
+            os.remove(tmp)
+            return "http_" .. tostring(code or "unknown")
+        end
+        return "downloaded"
+    end
+
+    return run_request_in_subprocess(request_to_tmp, function(status)
+        local ok, err = pcall(process_result, status)
+        if not ok then
+            logger.warn("单向历: 处理下载结果失败", tostring(err))
             os.remove(tmp)
             finish(false, "network_error")
         end
-    end
-
-    local request_ok, request_err = pcall(function()
-        HTTPClient:new():request({
-            url = url,
-            on_headers = function(headers)
-                headers:add("Referer", "https://img.owspace.com/")
-                headers:add("User-Agent", "Mozilla/5.0 (compatible; KOReader)")
-            end,
-        }, on_response)
     end)
-    if not request_ok then
-        logger.warn("单向历: 无法启动异步请求", tostring(request_err))
-        finish(false, "network_error")
-    end
 end
 
 ----------------------------------------------------------------------
@@ -363,10 +469,11 @@ function DanXiangLi:_download_today(t, today_str, opts, retry_attempt, notify_fa
     active_download = request_token
     self._busy = true
     local generation = self._request_generation
-    download_image(t.year, t.month, t.day, today_str, function()
+    local worker = download_image(t.year, t.month, t.day, today_str, function()
         return not self._stopped and generation == self._request_generation
     end, function(success, status)
         if active_download == request_token then
+            self._download_worker = nil
             active_download = nil
         end
 
@@ -415,6 +522,9 @@ function DanXiangLi:_download_today(t, today_str, opts, retry_attempt, notify_fa
         end
         run_pending_download_check()
     end)
+    -- Startup failure can invoke the callback synchronously and start another
+    -- request after a date change. Do not overwrite that newer worker handle.
+    if active_download == request_token then self._download_worker = worker end
 end
 
 -- 自动配置屏保；首次配置前保存原值，关闭开关时恢复
@@ -517,12 +627,16 @@ function DanXiangLi:_cancel_scheduled_work()
     self._retry_attempt = nil
     self._retry_opts = nil
     self._loop_at = nil
-    if self._scheduler_callback then
-        UIManager:unschedule(self._scheduler_callback)
-        self._scheduler_callback = nil
+    if active_instance == self then
+        active_instance = nil
+        pending_download_check = false
+        pending_download_opts = nil
     end
-    self._scheduler_at = nil
-    if active_instance == self then active_instance = nil end
+    if self._download_worker then
+        self._download_worker:cancel()
+    end
+    -- The shared scheduler remains only long enough to reap a cancelled child.
+    schedule_next_check()
 end
 
 function DanXiangLi:onCloseWidget()
@@ -557,58 +671,70 @@ function DanXiangLi:_cancel_retry()
     self:_schedule_next_check()
 end
 
--- All timed work shares one UIManager callback. Deadlines are kept separately,
--- but only the earliest one is ever scheduled.
-function DanXiangLi:_schedule_next_check()
-    if self._stopped or active_instance ~= self then return end
-    local next_at
-    local function consider(deadline)
-        if deadline and (not next_at or deadline < next_at) then
-            next_at = deadline
+-- All timed work, including worker polling/reaping across UI transitions,
+-- shares one module-level UIManager callback.
+schedule_next_check = function()
+    if scheduler_callback then
+        UIManager:unschedule(scheduler_callback)
+        scheduler_callback = nil
+    end
+    local delay
+    local function consider(wait)
+        if wait and (not delay or wait < delay) then
+            delay = wait
         end
     end
-    consider(self._startup_at)
-    consider(self._resume_at)
-    consider(self._retry_at)
-    consider(self._loop_at)
-    if not next_at then return end
-    if self._scheduler_callback and self._scheduler_at == next_at then return end
-    if self._scheduler_callback then
-        UIManager:unschedule(self._scheduler_callback)
-    end
-    self._scheduler_at = next_at
-    self._scheduler_callback = function()
-        self._scheduler_callback = nil
-        self._scheduler_at = nil
-        if self._stopped or active_instance ~= self then return end
-
+    local instance = active_instance
+    if instance and not instance._stopped then
         local now = os.time()
-        local should_run = false
-        if self._startup_at and self._startup_at <= now then
-            self._startup_at = nil
-            should_run = true
+        for _, key in ipairs({ "_startup_at", "_resume_at", "_retry_at", "_loop_at" }) do
+            local deadline = instance[key]
+            if deadline then consider(deadline - now) end
         end
-        if self._resume_at and self._resume_at <= now then
-            self._resume_at = nil
-            should_run = true
-        end
-        if self._loop_at and self._loop_at <= now then
-            self._loop_at = now + CHECK_INTERVAL
-            should_run = true
-        end
-        if self._retry_at and self._retry_at <= now then
-            local attempt, opts = self._retry_attempt, self._retry_opts
-            self._retry_at = nil
-            self._retry_attempt = nil
-            self._retry_opts = nil
-            self:_retry_round(attempt, opts)
-        end
-        if should_run and not self._busy then
-            self:_run()
-        end
-        self:_schedule_next_check()
     end
-    UIManager:scheduleIn(math.max(0, next_at - os.time()), self._scheduler_callback)
+    if active_worker then consider(active_worker.poll_at - worker_now()) end
+    if not delay then return end
+
+    scheduler_callback = function()
+        scheduler_callback = nil
+        local worker = active_worker
+        if worker and worker.poll_at <= worker_now() then worker:poll() end
+        local current = active_instance
+        if current and not current._stopped then
+            current:_process_scheduled_work()
+        end
+        schedule_next_check()
+    end
+    UIManager:scheduleIn(math.max(0, delay), scheduler_callback)
+end
+
+function DanXiangLi:_schedule_next_check()
+    schedule_next_check()
+end
+
+function DanXiangLi:_process_scheduled_work()
+    local now = os.time()
+    local should_run = false
+    if self._startup_at and self._startup_at <= now then
+        self._startup_at = nil
+        should_run = true
+    end
+    if self._resume_at and self._resume_at <= now then
+        self._resume_at = nil
+        should_run = true
+    end
+    if self._loop_at and self._loop_at <= now then
+        self._loop_at = now + CHECK_INTERVAL
+        should_run = true
+    end
+    if self._retry_at and self._retry_at <= now then
+        local attempt, opts = self._retry_attempt, self._retry_opts
+        self._retry_at = nil
+        self._retry_attempt = nil
+        self._retry_opts = nil
+        self:_retry_round(attempt, opts)
+    end
+    if should_run and not self._busy then self:_run() end
 end
 
 -- Periodic fallback shares the central timer with startup, resume and retries.
