@@ -76,7 +76,14 @@ local function fixture(options)
     end
     function ui:preventStandby() f.locks = f.locks + 1 end
     function ui:allowStandby() f.locks = f.locks - 1; assert(f.locks >= 0) end
-    function ui:show(message) table.insert(f.messages, message.text) end
+    function ui:show(message)
+        table.insert(f.messages, message.text)
+        if message.ok_callback then f.confirmation = message end
+    end
+    function ui:close(widget)
+        if f.confirmation == widget then f.confirmation = nil end
+    end
+    function ui:askForRestart(message) f.restart_message = message end
     function f:advance(seconds)
         local target, steps = self.now + seconds, 0
         while self.queue[1] and self.queue[1].at <= target + 0.000001 do
@@ -174,6 +181,7 @@ local function fixture(options)
         ["ui/widget/container/widgetcontainer"] = { extend = function(_, t) return t end },
         ["ui/uimanager"] = ui,
         ["ui/widget/infomessage"] = { new = function(_, t) return t end },
+        ["ui/widget/confirmbox"] = { new = function(_, t) return t end },
         ["logger"] = { info = function() end, warn = function() end, dbg = function() end },
         ["util"] = { makePath = function() end },
         ["socket.http"] = http,
@@ -207,11 +215,13 @@ local function fixture(options)
             end,
         },
     }
+    package.loaded.danxiangli_update = options.update
     for name, module in pairs(modules) do package.loaded[name] = module end
     local code = source:gsub('local SAVE_DIR = "[^"]+"', 'local SAVE_DIR = ' .. string.format("%q", f.prefix))
     local plugin = assert(loadstring(code, "@main.lua"))()
     function f:new_instance()
-        local obj = setmetatable({ ui = { menu = { registerToMainMenu = function() end } } }, { __index = plugin })
+        local obj = setmetatable({ ui = { menu = { registerToMainMenu = function() end } },
+            path = options.update and "plugins/danxiangli.koplugin", version = "1.5.0" }, { __index = plugin })
         obj:init()
         table.insert(self.instances, obj)
         return obj
@@ -473,7 +483,7 @@ test("one manual menu entry reuses valid current image", function()
     local f = fixture({ today_image = jpeg })
     local items = {}
     f.instance:addToMainMenu(items)
-    eq(#items.danxiangli.sub_item_table, 4)
+    eq(#items.danxiangli.sub_item_table, 5)
     eq(items.danxiangli.sub_item_table[2].text, "下载今日单向历")
     items.danxiangli.sub_item_table[2].callback()
     eq(f.count, 0)
@@ -608,6 +618,113 @@ test("UI transition defers temporary-file cleanup until old writer exits", funct
     f:advance(0.125)
     eq(f:read(".jpg.tmp"), nil)
     eq(f:read_named("20000101.jpg.tmp"), nil)
+    f:cleanup()
+end)
+
+local function update_fixture(options)
+    local counts = { checks = 0, prepared = 0, installed = 0, cleaned = 0, started = 0 }
+    options = options or {}
+    options.update = {
+        paths = function(path) return { live = path } end,
+        clean_after_start = function() counts.started = counts.started + 1 end,
+        check = function(version) eq(version, "1.5.0"); counts.checks = counts.checks + 1; return "available" end,
+        parse_result = function(status)
+            if status == "available" then return { version = "1.6.0", notes = "更新说明" } end
+        end,
+        make_stage = function() return "stage" end,
+        prepare = function() counts.prepared = counts.prepared + 1; return "prepared" end,
+        install = function() counts.installed = counts.installed + 1; return "installed" end,
+        remove_stage = function() counts.cleaned = counts.cleaned + 1 end,
+    }
+    return fixture(options), counts
+end
+
+test("manual update waits for the image worker, confirms, and asks to restart", function()
+    local f, counts = update_fixture()
+    f.instance:download_today()
+    local items = {}
+    f.instance:addToMainMenu(items)
+    local check = items.danxiangli.sub_item_table[4]
+    eq(check.text, "检查插件更新")
+    check.callback()
+    check.callback()
+    eq(f.count, 1)
+    f:complete(1)
+    f:advance(0.125)
+    eq(f.count, 2)
+    f:complete(2)
+    f:advance(0.125)
+    eq(counts.checks, 1)
+    eq(counts.prepared, 0)
+    assert(f.confirmation.text:find("1.6.0", 1, true))
+    f.confirmation.ok_callback()
+    eq(f.count, 3)
+    f:complete(3)
+    f:advance(0.125)
+    eq(counts.installed, 1)
+    eq(counts.cleaned, 1)
+    assert(f.restart_message:find("1.6.0", 1, true))
+    f:new_instance()
+    eq(counts.started, 1, "same process must keep the backup")
+    f:advance(600)
+    eq(f.count, 3)
+    f:cleanup()
+end)
+
+test("declining the update leaves the installation untouched", function()
+    local f, counts = update_fixture({ today_image = jpeg })
+    f.instance:_check_plugin_update()
+    f:complete(1)
+    f:advance(0.125)
+    f.confirmation.cancel_callback()
+    f:advance(600)
+    eq(f.count, 1)
+    eq(counts.prepared, 0)
+    eq(counts.installed, 0)
+    f:cleanup()
+end)
+
+test("a finished update from a closed interface cannot replace the plugin", function()
+    local f, counts = update_fixture({ today_image = jpeg })
+    f.instance:_check_plugin_update()
+    f:complete(1)
+    f:advance(0.125)
+    f.confirmation.ok_callback()
+    f:complete(2)
+    f:new_instance()
+    f:advance(0.125)
+    eq(counts.prepared, 1)
+    eq(counts.installed, 0)
+    eq(counts.cleaned, 1)
+    eq(f.restart_message, nil)
+    f:cleanup()
+end)
+
+test("wallpaper checks arriving during update wait for its worker to exit", function()
+    local f, counts = update_fixture()
+    f.instance:_check_plugin_update()
+    f.instance:download_today()
+    eq(f.count, 1)
+    f:complete(1)
+    f:advance(0.125)
+    eq(f.count, 2)
+    f:complete(2)
+    f:advance(0.125)
+    eq(counts.checks, 1)
+    eq(f:read(), jpeg)
+    f:cleanup()
+end)
+
+test("an unresponsive version check times out and releases the shared worker", function()
+    local f, counts = update_fixture({ today_image = jpeg })
+    f.instance:_check_plugin_update()
+    f:advance(60.125)
+    eq(f.jobs[1].killed, true)
+    eq(f.locks, 0)
+    eq(f.messages[#f.messages], "检查更新失败：下载超时")
+    eq(counts.installed, 0)
+    f.instance:_check_plugin_update()
+    eq(f.count, 2)
     f:cleanup()
 end)
 

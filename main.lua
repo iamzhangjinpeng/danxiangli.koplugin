@@ -28,6 +28,9 @@ local DanXiangLi = WidgetContainer:extend{ name = "danxiangli" }
 local active_instance
 local active_download
 local active_worker
+local update_startup_checked = false
+local update_needs_restart = false
+local update_recovery_path
 local scheduler_callback
 local schedule_next_check
 local pending_download_check = false
@@ -49,6 +52,7 @@ local MAX_RETRIES      = 6        -- Wi-Fi 重连等待的最大轮数
 local RETRY_BASE       = 10       -- 退避基数（秒）
 local RETRY_MAX        = 120      -- 单次退避上限（秒）
 local HTTP_TIMEOUT     = 20       -- 下载总时限（秒），由父进程强制执行
+local UPDATE_TIMEOUT   = 60
 local WORKER_POLL_INTERVAL = 0.125
 local HTTP404_COOLDOWN = 2 * 3600 -- 今日图未发布 (404) 后的冷却（秒）
 local MIN_JPEG_SIZE    = 1024
@@ -92,7 +96,7 @@ local function queue_download_check(opts)
 end
 
 local function run_pending_download_check()
-    if active_download or not pending_download_check then return end
+    if active_worker or active_download or not pending_download_check then return end
     local instance = active_instance
     if not instance or instance._stopped then
         -- The UI that requested this follow-up was closed. A future instance
@@ -106,6 +110,24 @@ local function run_pending_download_check()
     pending_download_check = false
     pending_download_opts = nil
     instance:_run(opts)
+end
+
+local function run_pending_work()
+    if active_worker or active_download or update_needs_restart then return end
+    local instance = active_instance
+    if instance and instance._pending_update then
+        local task = instance._pending_update
+        instance._pending_update = nil
+        task()
+    end
+    run_pending_download_check()
+end
+
+local function show_update_recovery()
+    UIManager:show(InfoMessage:new{
+        text = gettext("旧版自动恢复失败，请通过 USB 将备份目录改回 danxiangli.koplugin：\n")
+            .. update_recovery_path,
+    })
 end
 
 local function file_exists(path)
@@ -244,7 +266,7 @@ end
 
 -- Keep the worker alive only until its deadline or cancellation. Reaping is
 -- nonblocking; the same scheduler services both the worker and normal checks.
-local function run_request_in_subprocess(task, callback)
+local function run_request_in_subprocess(task, callback, timeout)
     local pid, read_fd
     local started, start_err = pcall(function()
         pid, read_fd = ffiutil.runInSubProcess(function(_, child_write_fd)
@@ -270,7 +292,7 @@ local function run_request_in_subprocess(task, callback)
     local worker = {
         pid = pid,
         read_fd = read_fd,
-        deadline = now + HTTP_TIMEOUT,
+        deadline = now + (timeout or HTTP_TIMEOUT),
         poll_at = now + WORKER_POLL_INTERVAL,
     }
 
@@ -316,6 +338,7 @@ local function run_request_in_subprocess(task, callback)
         end
         callback(status)
         cleanup_temporary_files()
+        run_pending_work()
     end
 
     active_worker = worker
@@ -504,6 +527,7 @@ function DanXiangLi:init()
     self._stopped = false
     self._request_generation = (self._request_generation or 0) + 1
     self._last_status = nil
+    if update_needs_restart then return end
 
     util.makePath(WALLPAPER_DIR)
     cleanup_temporary_files()
@@ -523,12 +547,21 @@ function DanXiangLi:init()
     self._retry_opts = nil
     self._loop_at = now + CHECK_INTERVAL
     self:_schedule_loop()
+    if not update_startup_checked and self.path then
+        update_startup_checked = true
+        local ok, err = pcall(function()
+            local Update = require("danxiangli_update")
+            local paths = Update.paths(self.path)
+            if paths then Update.clean_after_start(paths) end
+        end)
+        if not ok then logger.warn("单向历: 清理更新文件失败", tostring(err)) end
+    end
 end
 
 -- 请求完成回调：网络等待期间不占用 UI 事件循环。
 function DanXiangLi:_download_today(t, today_str, opts, retry_attempt, notify_failure)
     self:_cancel_retry()
-    if active_download then
+    if active_worker or active_download then
         queue_download_check(opts)
         return
     end
@@ -560,12 +593,12 @@ function DanXiangLi:_download_today(t, today_str, opts, retry_attempt, notify_fa
 
         if status == "stale_date" or current_date ~= today_str then
             queue_download_check(nil)
-            run_pending_download_check()
+            run_pending_work()
             return
         end
 
         if not instance_active then
-            run_pending_download_check()
+            run_pending_work()
             return
         end
 
@@ -592,7 +625,7 @@ function DanXiangLi:_download_today(t, today_str, opts, retry_attempt, notify_fa
                 UIManager:show(InfoMessage:new{ text = status_text(status), timeout = 3 })
             end
         end
-        run_pending_download_check()
+        run_pending_work()
     end)
     -- Startup failure can invoke the callback synchronously and start another
     -- request after a date change. Do not overwrite that newer worker handle.
@@ -730,6 +763,12 @@ function DanXiangLi:_cancel_scheduled_work()
     self._retry_attempt = nil
     self._retry_opts = nil
     self._loop_at = nil
+    self._pending_update = nil
+    self._update_busy = false
+    if self._update_dialog then
+        UIManager:close(self._update_dialog)
+        self._update_dialog = nil
+    end
     if active_instance == self then
         active_instance = nil
         pending_download_check = false
@@ -737,6 +776,9 @@ function DanXiangLi:_cancel_scheduled_work()
     end
     if self._download_worker then
         self._download_worker:cancel()
+    end
+    if self._update_worker then
+        self._update_worker:cancel()
     end
     -- The shared scheduler remains only long enough to reap a cancelled child.
     schedule_next_check()
@@ -753,7 +795,7 @@ function DanXiangLi:stopPlugin()
 end
 
 function DanXiangLi:onResume()
-    if self._stopped or active_instance ~= self then return end
+    if self._stopped or active_instance ~= self or update_needs_restart then return end
     self._resume_at = os.time() + RESUME_DELAY
     self:_schedule_next_check()
 end
@@ -788,7 +830,7 @@ schedule_next_check = function()
         end
     end
     local instance = active_instance
-    if instance and not instance._stopped then
+    if instance and not instance._stopped and not update_needs_restart then
         local now = os.time()
         for _, key in ipairs({ "_startup_at", "_resume_at", "_retry_at", "_loop_at" }) do
             local deadline = instance[key]
@@ -803,7 +845,7 @@ schedule_next_check = function()
         local worker = active_worker
         if worker and worker.poll_at <= worker_now() then worker:poll() end
         local current = active_instance
-        if current and not current._stopped then
+        if current and not current._stopped and not update_needs_restart then
             current:_process_scheduled_work()
         end
         schedule_next_check()
@@ -889,7 +931,7 @@ end
 
 -- 主入口：图片已存在走快速路径；缺失则下载；失败自动进入重试链
 function DanXiangLi:_run(opts)
-    if self._stopped then return end
+    if self._stopped or update_needs_restart then return end
     if self._busy then
         if opts and opts.notify then
             UIManager:show(InfoMessage:new{ text = gettext("单向历任务进行中…"), timeout = 2 })
@@ -938,8 +980,139 @@ end
 
 function DanXiangLi:download_today()
     if self._stopped then return end
+    if update_needs_restart then
+        if update_recovery_path then
+            show_update_recovery()
+        else
+            UIManager:askForRestart(gettext("单向历已安装新版，重启 KOReader 后生效。"))
+        end
+        return
+    end
     self:_cancel_retry()
     self:_run{ notify = true, ignore_cooldown = true }
+end
+
+----------------------------------------------------------------------
+-- 手动检查与安装插件更新
+----------------------------------------------------------------------
+
+local function update_message(text)
+    UIManager:show(InfoMessage:new{ text = text, timeout = 4 })
+end
+
+local function update_error(status)
+    if status == "missing_asset" then return gettext("正式版缺少安装 ZIP")
+    elseif status == "bad_release" then return gettext("无法验证发布信息")
+    elseif status == "redirect_error" then return gettext("下载跳转地址不受信任")
+    elseif status == "too_large" then return gettext("更新数据超过大小上限")
+    elseif status == "bad_digest" then return gettext("安装包校验失败")
+    elseif status == "bad_zip" then return gettext("安装包内容无效")
+    elseif status == "write_error" then return gettext("无法写入更新文件")
+    elseif status == "install_error" then return gettext("替换失败，旧版已保留")
+    end
+    return status_text(status)
+end
+
+function DanXiangLi:_queue_plugin_update(task)
+    self._update_busy = true
+    self._pending_update = task
+    if active_worker then update_message(gettext("正在等待当前单向历任务结束…")) end
+    run_pending_work()
+end
+
+function DanXiangLi:_run_plugin_update_worker(task, callback)
+    self._update_worker = run_request_in_subprocess(task, function(status)
+        self._update_worker = nil
+        self._update_busy = false
+        callback(status, not self._stopped and active_instance == self)
+    end, UPDATE_TIMEOUT)
+end
+
+function DanXiangLi:_install_plugin_update(Update, paths, release)
+    if self._stopped or active_instance ~= self or self._update_busy or update_needs_restart then return end
+    if not is_network_available() then update_message(gettext("无网络连接")); return end
+    self:_queue_plugin_update(function()
+        local stage, err = Update.make_stage(paths)
+        if not stage then
+            self._update_busy = false
+            update_message(gettext("安装失败：") .. update_error(err))
+            return
+        end
+        update_message(gettext("正在后台下载插件更新…"))
+        self:_run_plugin_update_worker(function()
+            return Update.prepare(stage, release)
+        end, function(status, current)
+            if current and status == "prepared" then
+                status = Update.install(paths, stage)
+                if status == "installed" or status == "restore_error" then
+                    update_needs_restart = true
+                end
+                if status == "restore_error" then update_recovery_path = paths.backup end
+            end
+            Update.remove_stage(paths, stage)
+            if not current then return end
+            if status == "installed" then
+                UIManager:askForRestart(gettext("单向历已安装 ") .. release.version .. gettext("，重启 KOReader 后生效。"))
+            elseif status == "restore_error" then
+                show_update_recovery()
+            else
+                update_message(gettext("安装失败：") .. update_error(status))
+            end
+        end)
+    end)
+end
+
+function DanXiangLi:_check_plugin_update()
+    if self._stopped or active_instance ~= self then return end
+    if update_needs_restart then
+        if update_recovery_path then
+            show_update_recovery()
+        else
+            UIManager:askForRestart(gettext("单向历的更新需要重启 KOReader。"))
+        end
+        return
+    end
+    if self._update_busy or self._update_dialog then
+        update_message(gettext("插件更新任务进行中…"))
+        return
+    end
+    if not is_network_available() then update_message(gettext("无网络连接")); return end
+
+    local Update = require("danxiangli_update")
+    local paths = Update.paths(self.path)
+    if not paths or type(self.version) ~= "string" then
+        update_message(gettext("无法确定插件的安装目录或版本"))
+        return
+    end
+    self:_queue_plugin_update(function()
+        update_message(gettext("正在后台检查插件更新…"))
+        self:_run_plugin_update_worker(function()
+            return Update.check(self.version)
+        end, function(status, current)
+            if not current then return end
+            local release = Update.parse_result(status)
+            if release then
+                local text = gettext("发现单向历新版本 ") .. release.version
+                    .. "\n" .. gettext("当前版本 ") .. self.version
+                if release.notes ~= "" then text = text .. "\n\n" .. release.notes end
+                local ConfirmBox = require("ui/widget/confirmbox")
+                self._update_dialog = ConfirmBox:new{
+                    text = text,
+                    ok_text = gettext("下载安装"),
+                    ok_callback = function()
+                        self._update_dialog = nil
+                        self:_install_plugin_update(Update, paths, release)
+                    end,
+                    cancel_callback = function() self._update_dialog = nil end,
+                }
+                UIManager:show(self._update_dialog)
+            elseif status == "current" then
+                update_message(gettext("单向历已是最新版 ") .. self.version)
+            else
+                update_message(gettext("检查更新失败：") .. update_error(status))
+            end
+        end)
+    end)
 end
 
 ----------------------------------------------------------------------
@@ -1015,6 +1188,10 @@ function DanXiangLi:addToMainMenu(menu_items)
                 callback = function() self:download_today() end,
             },
             { text = gettext("壁纸类型"), sub_item_table = wallpaper_types },
+            {
+                text = gettext("检查插件更新"),
+                callback = function() self:_check_plugin_update() end,
+            },
             {
                 text = gettext("诊断"),
                 callback = function()
