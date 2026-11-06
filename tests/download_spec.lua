@@ -8,6 +8,7 @@ local input = assert(real_open(main_path, "rb"))
 local source = input:read("*a")
 input:close()
 local jpeg = "\255\216" .. string.rep("x", 2048) .. "\255\217"
+local broken_jpeg = "\255\216" .. string.rep("?", 2048) .. "\255\217"
 local epoch = 1793404800
 local fixture_count = 0
 local function eq(actual, expected, label)
@@ -19,7 +20,7 @@ local function fixture(options)
     fixture_count = fixture_count + 1
     local base = tmp_root .. "/case-" .. fixture_count
     local f = { now = 0, queue = {}, jobs = {}, instances = {}, count = 0, locks = 0,
-        closes = 0, reads = 0, requests = 0, files = {}, messages = {}, prefix = base .. "-", options = options }
+        closes = 0, bytes_written = 0, reads = 0, requests = 0, files = {}, messages = {}, prefix = base .. "-", options = options }
     os.time = function(t) return t and real_time(t) or epoch + math.floor(f.now) + (f.wall_shift or 0) end
     local function today_name(suffix) return os.date("!%Y%m%d", os.time() + 8 * 3600) .. (suffix or ".jpg") end
     function f:read_named(name)
@@ -44,6 +45,7 @@ local function fixture(options)
         return {
             write = function(_, chunk)
                 if f.options.write_fail then return nil, "disk full" end
+                f.bytes_written = f.bytes_written + #chunk
                 return h:write(chunk)
             end,
             close = function()
@@ -146,9 +148,11 @@ local function fixture(options)
         local response = f.response
         if response.error then return nil, response.error end
         local body = response.body or (response.code == 200 and jpeg or "not found")
-        local ok, err = request.sink(body)
-        if not ok then return nil, err end
-        ok, err = request.sink(nil)
+        for _, chunk in ipairs(response.chunks or { body }) do
+            local ok, err = request.sink(chunk)
+            if not ok then return nil, err end
+        end
+        local ok, err = request.sink(nil)
         if not ok then return nil, err end
         return 1, response.code
     end
@@ -159,6 +163,13 @@ local function fixture(options)
     function settings:flush() end
     function settings:isTrue(k) return self.data[k] == true end
     G_reader_settings = settings
+    f.settings = settings
+    local function validate_source(path)
+        local file = assert(real_open(path, "rb"))
+        local data = file:read("*a")
+        file:close()
+        return data == jpeg, "decoder rejected file"
+    end
     local modules = {
         ["ui/widget/container/widgetcontainer"] = { extend = function(_, t) return t end },
         ["ui/uimanager"] = ui,
@@ -171,6 +182,15 @@ local function fixture(options)
         ["ui/time"] = { to_s = function(v) return v end, boottime_or_monotonic = function() return f.now end },
         ["ui/network/manager"] = { isConnected = function() return true end, isWifiOn = function() return true end },
         ["gettext"] = function(v) return v end,
+        ["danxiangli_wallpaper"] = {
+            MAX_JPEG_BYTES = 4 * 1024 * 1024,
+            validate_source = validate_source,
+            prepare = function(dir, source_path, style, refresh)
+                if options.prepare_wallpaper then return options.prepare_wallpaper(dir, source_path, style, refresh) end
+                if source_path and not validate_source(source_path) then return false, "decoder rejected file", true end
+                return false
+            end,
+        },
         ["libs/libkoreader-lfs"] = {
             dir = function(path)
                 eq(path, f.prefix, "scan stays inside plugin directory")
@@ -352,6 +372,7 @@ end)
 
 for _, case in ipairs({
     { name = "invalid JPEG", options = { responses = { { code = 200, body = "broken" } } }, status = "invalid_file" },
+    { name = "undecodable JPEG with valid markers", options = { responses = { { code = 200, body = broken_jpeg } } }, status = "invalid_file" },
     { name = "network failure", options = { responses = { { error = "connect failed" } } }, status = "network_error" },
     { name = "write failure", options = { write_fail = true }, status = "open_error" },
     { name = "close failure", options = { close_fail = true }, status = "open_error" },
@@ -372,6 +393,60 @@ for _, case in ipairs({
         f:cleanup()
     end)
 end
+
+test("an undecodable cached JPEG is replaced only after a valid retry", function()
+    local f = fixture({ today_image = jpeg, responses = { { code = 200, body = broken_jpeg }, { code = 200 } } })
+    f:advance(8)
+    eq(f.count, 0)
+    f:write(broken_jpeg)
+    f:write_named("20000101.jpg", jpeg)
+    f.instance:download_today()
+    eq(f.count, 1)
+    assert(f.instance:_diagnostics():find("今日图片: 文件损坏", 1, true))
+    f:complete(1)
+    f:advance(0.125)
+    eq(f.instance._last_status, "invalid_file")
+    eq(f:read(), broken_jpeg)
+    eq(f:read_named("20000101.jpg"), jpeg)
+    f:advance(10.25)
+    eq(f.count, 2)
+    f:complete(2)
+    f:advance(0.125)
+    eq(f:read(), jpeg)
+    eq(f:read_named("20000101.jpg"), nil)
+    assert(f.instance:_diagnostics():find("今日图片: 已就绪", 1, true))
+    f:cleanup()
+end)
+
+test("a response over the byte limit is stopped before writing the excess chunk", function()
+    local block = string.rep("x", 2 * 1024 * 1024)
+    local f = fixture({ responses = { { code = 200, chunks = { block, block, "excess" } } } })
+    f:write_named("20000101.jpg", jpeg)
+    f.instance:download_today()
+    f:complete(1)
+    f:advance(0.125)
+    eq(f.bytes_written, 4 * 1024 * 1024)
+    eq(f.instance._last_status, "file_too_large")
+    eq(f:read_named("20000101.jpg"), jpeg)
+    eq(f:read(".jpg.tmp"), nil)
+    f:cleanup()
+end)
+
+test("a wallpaper write failure does not trigger another download", function()
+    local f = fixture({
+        prepare_wallpaper = function(_, path)
+            return false, path and "disk full"
+        end,
+    })
+    f.instance:download_today()
+    f:complete(1)
+    f:advance(0.125)
+    eq(f:read(), jpeg)
+    f.instance:download_today()
+    eq(f.count, 1)
+    assert(f.messages[#f.messages]:find("壁纸生成失败", 1, true))
+    f:cleanup()
+end)
 
 test("fork failure releases request without reading invalid fd", function()
     local f = fixture({ fork_fail = true })
@@ -398,13 +473,57 @@ test("one manual menu entry reuses valid current image", function()
     local f = fixture({ today_image = jpeg })
     local items = {}
     f.instance:addToMainMenu(items)
-    eq(#items.danxiangli.sub_item_table, 3)
+    eq(#items.danxiangli.sub_item_table, 4)
     eq(items.danxiangli.sub_item_table[2].text, "下载今日单向历")
     items.danxiangli.sub_item_table[2].callback()
     eq(f.count, 0)
     eq(f.messages[#f.messages], "今日单向历已存在")
     eq(f:read(), jpeg)
     eq(f.instance.force_redownload, nil)
+    f:cleanup()
+end)
+
+test("switching wallpaper style uses the local JPEG and remembers the selection", function()
+    local latest
+    local f = fixture({
+        files = { ["20000101.jpg"] = jpeg },
+        prepare_wallpaper = function(dir, path, style)
+            latest = { dir = dir, path = path, style = style }
+            return path ~= nil
+        end,
+    })
+    local items = {}
+    f.instance:addToMainMenu(items)
+    local menu = items.danxiangli.sub_item_table
+    local fullscreen, card = unpack(menu[3].sub_item_table)
+    assert(fullscreen.checked_func())
+    eq(latest.path, f.prefix .. "20000101.jpg")
+    card.callback()
+    assert(card.checked_func())
+    eq(latest.style, "card")
+    eq(latest.path, f.prefix .. "20000101.jpg")
+    eq(f.settings:readSetting("screensaver_dir"), nil)
+    eq(f.count, 0)
+    menu[1].callback()
+    eq(f.settings:readSetting("screensaver_dir"), latest.dir)
+    f:new_instance()
+    eq(latest.style, "card")
+    eq(f.count, 0)
+    f:cleanup()
+end)
+
+test("screensaver uses only generated wallpapers even when rendering fails", function()
+    local f = fixture({
+        today_image = jpeg,
+        prepare_wallpaper = function() return false, "rendering failed" end,
+    })
+    local items = {}
+    f.instance:addToMainMenu(items)
+    f.settings:saveSetting("screensaver_dir", "/original/")
+    items.danxiangli.sub_item_table[1].callback()
+    eq(f.settings:readSetting("screensaver_dir"), f.prefix .. "wallpaper/")
+    f.instance:stopPlugin()
+    eq(f.settings:readSetting("screensaver_dir"), "/original/")
     f:cleanup()
 end)
 

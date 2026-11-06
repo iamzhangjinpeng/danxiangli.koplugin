@@ -37,6 +37,7 @@ local http404_cooldown_until
 
 local BASE_URL = "https://img.owspace.com/Public/uploads/Download/"
 local SAVE_DIR = "/mnt/us/koreader/screenshots/danxiangli/"
+local WALLPAPER_DIR = SAVE_DIR .. "wallpaper/"
 
 -- 单向历按北京时间发布；固定偏移，不依赖设备时区
 local UTC_OFFSET = 8 * 3600
@@ -54,6 +55,11 @@ local MIN_JPEG_SIZE    = 1024
 
 local SETTING_AUTO_SCREENSAVER = "danxiangli_auto_screensaver"
 local SETTING_SCREENSAVER_BACKUP = "danxiangli_screensaver_backup"
+local SETTING_WALLPAPER_STYLE = "danxiangli_wallpaper_style"
+local WALLPAPER_STYLES = {
+    { "fullscreen", gettext("全屏") },
+    { "card", gettext("圆角白卡") },
+}
 
 ----------------------------------------------------------------------
 -- 工具
@@ -142,6 +148,17 @@ local function each_jpg(callback)
     end
 end
 
+local function latest_cached_image()
+    local latest
+    each_jpg(function(name)
+        if name:match("^%d%d%d%d%d%d%d%d%.jpg$")
+            and (not latest or name > latest) and is_valid_jpeg(SAVE_DIR .. name) then
+            latest = name
+        end
+    end)
+    return latest and SAVE_DIR .. latest
+end
+
 -- 只删除非今日图片（SAVE_DIR 由本插件独占，安全）
 local function cleanup_old_images(keep_date_str)
     local keep_name = keep_date_str .. ".jpg"
@@ -182,6 +199,13 @@ local function is_auto_screensaver_enabled()
     return v == nil or v == true -- 首次安装默认开启
 end
 
+local function wallpaper_style()
+    if G_reader_settings and G_reader_settings:readSetting(SETTING_WALLPAPER_STYLE) == "card" then
+        return "card"
+    end
+    return "fullscreen"
+end
+
 local function set_auto_screensaver_enabled(enabled)
     if G_reader_settings then
         G_reader_settings:saveSetting(SETTING_AUTO_SCREENSAVER, enabled)
@@ -200,6 +224,7 @@ local function status_text(status)
     elseif status == "open_error" then return gettext("无法创建文件（权限或空间不足）")
     elseif status == "network_error" then return gettext("网络请求失败")
     elseif status == "timeout" then return gettext("下载超时")
+    elseif status == "file_too_large" then return gettext("图片超过下载大小上限")
     elseif status == "invalid_file" then return gettext("下载文件校验失败")
     elseif status == "rename_error" then return gettext("文件替换失败")
     elseif type(status) == "string" and status:match("^http_") then
@@ -369,17 +394,24 @@ local function download_image(year, month, day, date_str, is_active, callback)
     end
 
     local function request_to_tmp()
+        local Wallpaper = require("danxiangli_wallpaper")
         local file, err = io.open(tmp, "wb")
         if not file then
             logger.warn("单向历: 无法创建临时文件", tostring(err))
             return "open_error"
         end
 
-        local write_error
+        local write_error, limit_hit
+        local received = 0
         -- This sink never closes the file; request_to_tmp owns its one close.
         local function sink(chunk, err)
             if err then return nil, err end
             if chunk then
+                received = received + #chunk
+                if received > Wallpaper.MAX_JPEG_BYTES then
+                    limit_hit = true
+                    return nil, "download size limit"
+                end
                 local write_ok, wrote, write_err = pcall(file.write, file, chunk)
                 if not write_ok then write_err = wrote end
                 if not write_ok or not wrote then
@@ -411,6 +443,11 @@ local function download_image(year, month, day, date_str, is_active, callback)
             os.remove(tmp)
             return "open_error"
         end
+        if limit_hit then
+            logger.warn("单向历: 下载响应超过大小上限", Wallpaper.MAX_JPEG_BYTES)
+            os.remove(tmp)
+            return "file_too_large"
+        end
         if not request_ok then
             logger.warn("单向历: 网络请求异常", tostring(ok))
             os.remove(tmp)
@@ -425,6 +462,19 @@ local function download_image(year, month, day, date_str, is_active, callback)
             logger.warn("单向历: HTTP", tostring(code))
             os.remove(tmp)
             return "http_" .. tostring(code or "unknown")
+        end
+        if not is_valid_jpeg(tmp) then
+            logger.warn("单向历: 文件校验失败")
+            os.remove(tmp)
+            return "invalid_file"
+        end
+        -- Decode while the file is still staged. The parent only promotes
+        -- a decodable JPEG, so a bad response cannot evict the previous image.
+        local valid, validation_error = Wallpaper.validate_source(tmp)
+        if not valid then
+            logger.warn("单向历: 下载的 JPEG 无法解码", tostring(validation_error))
+            os.remove(tmp)
+            return "invalid_file"
         end
         return "downloaded"
     end
@@ -455,8 +505,9 @@ function DanXiangLi:init()
     self._request_generation = (self._request_generation or 0) + 1
     self._last_status = nil
 
-    util.makePath(SAVE_DIR)
+    util.makePath(WALLPAPER_DIR)
     cleanup_temporary_files()
+    self:_refresh_wallpaper()
     if is_auto_screensaver_enabled() then
         self:_ensure_screensaver_settings()
     else
@@ -521,10 +572,14 @@ function DanXiangLi:_download_today(t, today_str, opts, retry_attempt, notify_fa
         self._last_status = status
 
         if success then
+            local _, wallpaper_error = self:_refresh_wallpaper(SAVE_DIR .. today_str .. ".jpg", true)
             cleanup_old_images(today_str)
             self:_cancel_retry()
             if opts and opts.notify then
-                UIManager:show(InfoMessage:new{ text = gettext("单向历已更新"), timeout = 2 })
+                UIManager:show(InfoMessage:new{
+                    text = wallpaper_error and gettext("今日图片已下载，壁纸生成失败") or gettext("单向历已更新"),
+                    timeout = 2,
+                })
             end
         elseif status == "http_404" then
             self:_cancel_retry()
@@ -542,6 +597,36 @@ function DanXiangLi:_download_today(t, today_str, opts, retry_attempt, notify_fa
     -- Startup failure can invoke the callback synchronously and start another
     -- request after a date change. Do not overwrite that newer worker handle.
     if active_download == request_token then self._download_worker = worker end
+end
+
+function DanXiangLi:_refresh_wallpaper(source, refresh, verify_cache)
+    local ok, available, failure, invalid_source = pcall(function()
+        local Wallpaper = require("danxiangli_wallpaper")
+        source = source or latest_cached_image()
+        return Wallpaper.prepare(WALLPAPER_DIR, source, wallpaper_style(), refresh, verify_cache)
+    end)
+    if not ok then
+        failure, available = available, false
+        logger.warn("单向历: 壁纸更新失败", tostring(failure))
+    end
+    self._undecodable_source = invalid_source and source or nil
+    return available, failure, invalid_source
+end
+
+function DanXiangLi:_select_wallpaper_style(style)
+    if self._stopped or not G_reader_settings then return end
+    if wallpaper_style() ~= style then
+        G_reader_settings:saveSetting(SETTING_WALLPAPER_STYLE, style)
+        G_reader_settings:flush()
+    end
+    local available, failure = self:_refresh_wallpaper()
+    local message
+    if failure then
+        message = gettext("壁纸生成失败，稍后会用缓存重试")
+    elseif not available then
+        message = gettext("已保存壁纸类型，下载图片后生效")
+    end
+    if message then UIManager:show(InfoMessage:new{ text = message, timeout = 3 }) end
 end
 
 -- 自动配置屏保；首次配置前保存原值，关闭开关时恢复
@@ -572,8 +657,8 @@ function DanXiangLi:_ensure_screensaver_settings(force)
         G_reader_settings:saveSetting("screensaver_type", "random_image")
         changed = true
     end
-    if G_reader_settings:readSetting("screensaver_dir") ~= SAVE_DIR then
-        G_reader_settings:saveSetting("screensaver_dir", SAVE_DIR)
+    if G_reader_settings:readSetting("screensaver_dir") ~= WALLPAPER_DIR then
+        G_reader_settings:saveSetting("screensaver_dir", WALLPAPER_DIR)
         changed = true
     end
     -- 正确键名是 screensaver_stretch_images：不拉伸时图按比例缩放，
@@ -628,6 +713,7 @@ function DanXiangLi:deletePluginSettings()
     if not G_reader_settings then return end
     self:_restore_screensaver_settings(true)
     G_reader_settings:delSetting(SETTING_AUTO_SCREENSAVER)
+    G_reader_settings:delSetting(SETTING_WALLPAPER_STYLE)
     G_reader_settings:delSetting("danxiangli_last_date")
     G_reader_settings:flush()
 end
@@ -781,9 +867,12 @@ function DanXiangLi:_retry_round(attempt, opts)
     local t, today_str, today_path = get_today_info()
     if not (opts and opts.ignore_cooldown) and is_http404_cooling(today_str) then return end
     if is_valid_jpeg(today_path) then
-        cleanup_old_images(today_str)
-        self:_cancel_retry()
-        return
+        local _, _, invalid_source = self:_refresh_wallpaper(today_path)
+        if not invalid_source then
+            cleanup_old_images(today_str)
+            self:_cancel_retry()
+            return
+        end
     end
     if not self:_wifi_on() then
         logger.dbg("单向历: Wi-Fi 关闭，停止重试")
@@ -810,13 +899,18 @@ function DanXiangLi:_run(opts)
 
     util.makePath(SAVE_DIR)
     local t, today_str, today_path = get_today_info()
+    local today_ready = is_valid_jpeg(today_path)
+    local _, wallpaper_error, invalid_source = self:_refresh_wallpaper(today_ready and today_path or nil, nil, opts and opts.notify)
 
     -- 自动和手动下载均复用有效今日图，避免不必要的重复请求。
-    if is_valid_jpeg(today_path) then
+    if today_ready and not invalid_source then
         self:_cancel_retry()
         cleanup_old_images(today_str)
         if opts and opts.notify then
-            UIManager:show(InfoMessage:new{ text = gettext("今日单向历已存在"), timeout = 2 })
+            UIManager:show(InfoMessage:new{
+                text = wallpaper_error and gettext("今日图片已保存，壁纸生成失败") or gettext("今日单向历已存在"),
+                timeout = 2,
+            })
         end
         return
     end
@@ -856,7 +950,7 @@ function DanXiangLi:_diagnostics()
     local _, today_str, today_path = get_today_info()
     local lines = {}
     lines[#lines + 1] = gettext("目录: ") .. SAVE_DIR
-    if is_valid_jpeg(today_path) then
+    if self._undecodable_source ~= today_path and is_valid_jpeg(today_path) then
         lines[#lines + 1] = gettext("今日图片: 已就绪 (") .. today_str .. ")"
     elseif file_exists(today_path) then
         lines[#lines + 1] = gettext("今日图片: 文件损坏")
@@ -864,6 +958,7 @@ function DanXiangLi:_diagnostics()
         lines[#lines + 1] = gettext("今日图片: 未下载")
     end
     lines[#lines + 1] = gettext("最近状态: ") .. tostring(self._last_status or "-")
+    lines[#lines + 1] = gettext("壁纸类型: ") .. (wallpaper_style() == "card" and gettext("圆角白卡") or gettext("全屏"))
     lines[#lines + 1] = gettext("网络: ") .. (is_network_available() and gettext("已连接") or gettext("未连接"))
     if G_reader_settings then
         lines[#lines + 1] = gettext("屏保类型: ") .. tostring(G_reader_settings:readSetting("screensaver_type"))
@@ -879,6 +974,15 @@ end
 ----------------------------------------------------------------------
 
 function DanXiangLi:addToMainMenu(menu_items)
+    local wallpaper_types = {}
+    for _, item in ipairs(WALLPAPER_STYLES) do
+        local style, label = item[1], item[2]
+        wallpaper_types[#wallpaper_types + 1] = {
+            text = label,
+            checked_func = function() return wallpaper_style() == style end,
+            callback = function() self:_select_wallpaper_style(style) end,
+        }
+    end
     menu_items.danxiangli = {
         text = gettext("单向历"),
         sorting_hint = "tools",
@@ -890,6 +994,7 @@ function DanXiangLi:addToMainMenu(menu_items)
                     local enabled = not is_auto_screensaver_enabled()
                     if enabled then
                         -- Save the original screensaver settings before enabling.
+                        self:_refresh_wallpaper()
                         self:_ensure_screensaver_settings(true)
                         set_auto_screensaver_enabled(true)
                         UIManager:show(InfoMessage:new{
@@ -909,6 +1014,7 @@ function DanXiangLi:addToMainMenu(menu_items)
                 text = gettext("下载今日单向历"),
                 callback = function() self:download_today() end,
             },
+            { text = gettext("壁纸类型"), sub_item_table = wallpaper_types },
             {
                 text = gettext("诊断"),
                 callback = function()
