@@ -38,6 +38,7 @@ package.loaded["ssl.https"] = {
 }
 package.loaded["socket.http"] = {
     request = function(request)
+        assert(package.loaded["socket.http"].PROXY == nil, "updater must use direct HTTPS")
         assert(request.redirect == false)
         local host = assert(request.url:match("^https://([^/]+)/"))
         local ok, err = request.create():connect(host, 443)
@@ -167,17 +168,6 @@ test("separates TLS and HTTP failure from an up-to-date result", function()
     eq(Update.check("1.10.0"), "too_large")
 end)
 
-test("reports the configured HTTP proxy before making a request", function()
-    fixture_release("1.10.0")
-    local http = require("socket.http")
-    http.PROXY = "http://127.0.0.1:8080"
-    eq(Update.check("1.5.0"), "proxy_unsupported")
-    eq(Update.prepare("unused", { version = "1.10.0", size = #data, digest = digest }), "proxy_unsupported")
-    eq(#responses, 1, "must not send a request or bypass the proxy")
-    eq(http.PROXY, "http://127.0.0.1:8080")
-    http.PROXY = nil
-end)
-
 local function installed_fixture()
     local root = scratch .. "/case-" .. tests
     assert(lfs.mkdir(root))
@@ -188,6 +178,22 @@ local function installed_fixture()
     local candidate = { version = "1.10.0", size = #data, digest = digest }
     return paths, stage, candidate
 end
+
+test("clears KOReader's HTTP proxy for direct updater requests", function()
+    local http = require("socket.http")
+    fixture_release("1.10.0")
+    http.PROXY = "http://127.0.0.1:8080"
+    assert(Update.parse_result(Update.check("1.5.0")))
+    eq(http.PROXY, nil)
+
+    local paths, stage = installed_fixture()
+    http.PROXY = "http://127.0.0.1:8080"
+    fixture_download()
+    local candidate = { version = "1.10.0", size = #data, digest = digest }
+    eq(Update.prepare(stage, candidate), "prepared")
+    eq(http.PROXY, nil)
+    Update.remove_stage(paths, stage)
+end)
 
 test("validates, extracts, and replaces the directory while retaining the backup", function()
     local paths, stage, candidate = installed_fixture()

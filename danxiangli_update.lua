@@ -66,9 +66,10 @@ end
 
 local function get(url, limit, asset)
     local http = require("socket.http")
-    -- LuaSocket redirects the connection to http.PROXY. The updater uses
-    -- direct HTTPS and must not silently bypass the user's proxy setting.
-    if http.PROXY then return nil, "proxy_unsupported" end
+    -- HTTPS requests use a custom LuaSec connector, which cannot tunnel
+    -- through LuaSocket's HTTP proxy. This runs in an isolated child process,
+    -- so clearing PROXY here does not change KOReader's network settings.
+    http.PROXY = nil
     local https = require("ssl.https")
     local socketutil = require("socketutil")
     socketutil:set_timeout(10, 20)

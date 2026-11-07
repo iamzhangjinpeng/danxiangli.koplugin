@@ -1021,7 +1021,6 @@ end
 local function update_error(status)
     if status == "missing_asset" then return gettext("正式版缺少安装 ZIP")
     elseif status == "bad_release" then return gettext("无法验证发布信息")
-    elseif status == "proxy_unsupported" then return gettext("KOReader 已启用 HTTP 代理，单向历在线更新需要直连 GitHub。可用 USB 更新。")
     elseif status == "redirect_error" then return gettext("下载跳转地址不受信任")
     elseif status == "too_large" then return gettext("更新数据超过大小上限")
     elseif status == "bad_digest" then return gettext("安装包校验失败")
