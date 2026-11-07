@@ -14,6 +14,7 @@ local MAX_IMAGE_EDGE = 4096
 local PNG_SIGNATURE = "\137PNG\r\n\26\n"
 local PNG_END = "\0\0\0\0IEND\174\66\96\130"
 local verified_png
+local published_png
 
 local function round(value)
     return math.floor(value + 0.5)
@@ -39,8 +40,8 @@ local function valid_png(path, attrs)
     local head = file:read(24)
     local tail
     if file:seek("end", -12) then tail = file:read(12) end
-    file:close()
-    if not head or #head ~= 24 or head:sub(1, 16) ~= PNG_SIGNATURE .. "\0\0\0\13IHDR"
+    if not file:close() or not head or #head ~= 24 or not tail or #tail ~= 12 then return nil end
+    if head:sub(1, 16) ~= PNG_SIGNATURE .. "\0\0\0\13IHDR"
         or tail ~= PNG_END then return false end
     if not dimensions_fit(big_endian(head, 17, 4), big_endian(head, 21, 4), MAX_PNG_PIXELS) then return false end
 
@@ -48,19 +49,25 @@ local function valid_png(path, attrs)
     local Png = require("ffi/png")
     local called, ok, image = pcall(Png.decodeFromFile, path, 1)
     if not called then return nil end
-    if not ok then return false end
+    if not ok then
+        if image == "couldn't open PNG file" or image == "memory allocation failed" then return nil end
+        return false
+    end
     ffi.C.free(image.data)
     return true
 end
 
+local function same_file(attrs, saved)
+    return attrs and saved and attrs.mode == saved.mode and attrs.size == saved.size
+        and attrs.modification == saved.modification and attrs.change == saved.change
+        and attrs.ino == saved.ino and attrs.dev == saved.dev
+end
+
 local function cached_png_is_valid(path)
     local attrs = lfs.attributes(path)
-    if not attrs then return false end
+    if not attrs then return nil end
     local saved = verified_png and verified_png.path == path and verified_png.attrs
-    if saved and attrs.mode == saved.mode and attrs.size == saved.size and attrs.modification == saved.modification
-        and attrs.change == saved.change and attrs.ino == saved.ino and attrs.dev == saved.dev then
-        return true
-    end
+    if same_file(attrs, saved) then return true end
     local valid = valid_png(path, attrs)
     if not valid then return valid end
     verified_png = { path = path, attrs = attrs }
@@ -213,11 +220,21 @@ local function render(source, target, width, height)
     return ok, err, invalid_source
 end
 
+-- Older versions staged unreadable caches under a suffix. Keep accepting them
+-- as cache candidates so an upgrade can recover those files.
+local function cache_key(path)
+    return path:match("^(.*%.png)%.pending%d*$") or path
+end
+
+local function cache_date(path)
+    return path:match("(%d%d%d%d%d%d%d%d)%-[^/]+$")
+end
+
 local function generated_images(dir)
     local paths = {}
     if lfs.attributes(dir, "mode") ~= "directory" then return paths end
     for name in lfs.dir(dir) do
-        local style = name:match("^%d%d%d%d%d%d%d%d%-(%a+)%-%d+%-%d+x%d+%-%-?%d+%-%d+%.png$")
+        local style = cache_key(name):match("^%d%d%d%d%d%d%d%d%-(%a+)%-%d+%-%d+x%d+%-%-?%d+%-%d+%.png$")
         if (style == "fullscreen" or style == "card") and lfs.attributes(dir .. name, "mode") == "file" then
             paths[#paths + 1] = dir .. name
         end
@@ -225,18 +242,120 @@ local function generated_images(dir)
     return paths
 end
 
-local function keep_wallpaper(paths, keep)
+local function remove_wallpaper(path)
+    local removed, err = os.remove(path)
+    if not removed then logger.warn("单向历: 无法清理壁纸", path, tostring(err)) end
+end
+
+local function prune_replaced_cache(paths, keep, date)
     for _, path in ipairs(paths) do
-        if path ~= keep then
-            local removed, err = os.remove(path)
-            if not removed then logger.warn("单向历: 无法清理壁纸", path, tostring(err)) end
-        end
+        if path ~= keep and cache_date(path) <= date then remove_wallpaper(path) end
     end
 end
 
+local function find_cached_wallpaper(paths, newer_than, style)
+    table.sort(paths, function(a, b)
+        local left, right = cache_key(a), cache_key(b)
+        if left ~= right then return left > right end
+        return a < b -- Prefer the ordinary cache file for the same key.
+    end)
+    local failure
+    for _, path in ipairs(paths) do
+        if not newer_than or (cache_date(path) > newer_than and path:match("%d%-(%a+)%-[^/]+$") == style) then
+            local valid = cached_png_is_valid(path)
+            if valid then return path end
+            if valid == false then
+                remove_wallpaper(path)
+            else
+                failure = "Cannot verify the cached wallpaper"
+            end
+        end
+    end
+    return nil, failure
+end
+
+local function copy_png(source, target, size)
+    local input, err = io.open(source, "rb")
+    if not input then return nil, err end
+    local output
+    output, err = io.open(target, "wb")
+    if not output then
+        input:close()
+        return nil, err
+    end
+    local remaining = size
+    while remaining > 0 do
+        local length = math.min(remaining, 64 * 1024)
+        local data, read_error = input:read(length)
+        if not data or #data ~= length then
+            err = read_error or "Incomplete wallpaper read"
+            break
+        end
+        local wrote
+        wrote, err = output:write(data)
+        if not wrote then break end
+        remaining = remaining - length
+    end
+    input:close()
+    local closed, close_error = output:close()
+    if remaining ~= 0 or not closed then return nil, err or close_error or "Cannot copy the wallpaper" end
+    return true
+end
+
+-- Only a verified PNG is exposed to KOReader. Cache files and the staging
+-- file are outside the image list even if storage refuses to move or remove them.
+local function publish_wallpaper(source, dir, refreshed)
+    local target = dir .. "wallpaper.png"
+    local attrs = lfs.attributes(target)
+    local previous = published_png and published_png.target == target and published_png
+    local display_verified = previous and same_file(attrs, previous.target_attrs)
+    local source_attrs = source and lfs.attributes(source)
+    if not refreshed and display_verified and source == previous.source and same_file(source_attrs, previous.source_attrs) then
+        return true, nil, true
+    end
+
+    local failure
+    if source then
+        if not source_attrs or source_attrs.mode ~= "file" or source_attrs.size > MAX_PNG_BYTES then
+            failure = "Cannot read the wallpaper for display"
+        else
+            local ready
+            ready, failure = util.makePath(dir)
+            if ready then
+                local tmp = target .. ".tmp"
+                ready, failure = copy_png(source, tmp, source_attrs.size)
+                if ready then
+                    if valid_png(tmp, lfs.attributes(tmp)) then
+                        ready, failure = os.rename(tmp, target)
+                    else
+                        ready, failure = false, "Invalid wallpaper display copy"
+                    end
+                end
+                if ready then
+                    published_png = { source = source, source_attrs = source_attrs, target = target,
+                        target_attrs = lfs.attributes(target) }
+                    return true, nil, true
+                end
+                os.remove(tmp)
+            end
+            failure = failure or "Cannot publish the wallpaper"
+        end
+        logger.warn("单向历: 无法发布屏保图片", tostring(failure))
+    end
+    if display_verified then return true, failure end
+    if not attrs then return false, failure end
+    local valid = valid_png(target, attrs)
+    if valid then
+        published_png = { target = target, target_attrs = attrs }
+        return true, failure
+    end
+    if valid == false then remove_wallpaper(target) end
+    return false, failure or "Cannot verify the displayed wallpaper"
+end
+
 -- Keep the last usable wallpaper until a complete replacement is available.
-function Wallpaper.prepare(dir, source, style, refresh, verify_cache)
-    if verify_cache then verified_png = nil end
+function Wallpaper.prepare(dir, source, style, refresh, verify_cache, display_dir)
+    if verify_cache then verified_png, published_png = nil, nil end
     local previous = generated_images(dir)
     local tmp = dir .. "wallpaper.png.tmp"
     os.remove(tmp)
@@ -255,6 +374,7 @@ function Wallpaper.prepare(dir, source, style, refresh, verify_cache)
                 width or 0, height or 0, attrs.modification, attrs.size)
             local target = dir .. key
             local ready = not refresh and cached_png_is_valid(target)
+            local rendered
             if not ready then
                 local made, mkdir_err = util.makePath(dir)
                 if made then
@@ -262,7 +382,10 @@ function Wallpaper.prepare(dir, source, style, refresh, verify_cache)
                     if ready then
                         if valid_png(tmp, lfs.attributes(tmp)) then
                             ready, failure = os.rename(tmp, target)
-                            if ready then verified_png = { path = target, attrs = lfs.attributes(target) } end
+                            if ready then
+                                rendered = true
+                                verified_png = { path = target, attrs = lfs.attributes(target) }
+                            end
                         else
                             ready, failure = false, "Invalid generated wallpaper PNG"
                         end
@@ -273,25 +396,19 @@ function Wallpaper.prepare(dir, source, style, refresh, verify_cache)
                 end
             end
             if ready then
-                keep_wallpaper(previous, target)
-                return true
+                local candidate = find_cached_wallpaper(previous, date, style) or target
+                local available, publish_error, published = publish_wallpaper(candidate, display_dir,
+                    rendered and candidate == target)
+                if rendered and published then prune_replaced_cache(previous, target, date) end
+                return available, publish_error
             end
         end
         failure = failure or "Cannot prepare the wallpaper"
         logger.warn("单向历: 壁纸生成失败", tostring(failure))
     end
-    table.sort(previous, function(a, b) return a > b end)
-    local invalid = {}
-    for _, path in ipairs(previous) do
-        local valid = cached_png_is_valid(path)
-        if valid then
-            keep_wallpaper(previous, path)
-            return true, failure, invalid_source
-        end
-        if valid == false then invalid[#invalid + 1] = path end
-    end
-    keep_wallpaper(invalid)
-    return false, failure, invalid_source
+    local candidate, cache_error = find_cached_wallpaper(previous)
+    local available, publish_error = publish_wallpaper(candidate, display_dir)
+    return available, failure or publish_error or cache_error, invalid_source
 end
 
 return Wallpaper

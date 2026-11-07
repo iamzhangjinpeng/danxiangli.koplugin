@@ -66,6 +66,9 @@ end
 
 local function get(url, limit, asset)
     local http = require("socket.http")
+    -- LuaSocket redirects the connection to http.PROXY. The updater uses
+    -- direct HTTPS and must not silently bypass the user's proxy setting.
+    if http.PROXY then return nil, "proxy_unsupported" end
     local https = require("ssl.https")
     local socketutil = require("socketutil")
     socketutil:set_timeout(10, 20)
@@ -80,6 +83,11 @@ local function get(url, limit, asset)
         local function create()
             local connection = tcp()
             local connect = connection.connect
+            -- LuaSocket can close the connection before LuaSec has installed
+            -- its TLS methods, for example after a failed handshake.
+            function connection:close()
+                return self.sock:close()
+            end
             function connection:connect(peer, port)
                 if peer ~= host or tonumber(port) ~= 443 then return nil, "unexpected HTTPS peer" end
                 local ok, err = connect(self, peer, port)
@@ -191,6 +199,10 @@ local function mode(path)
     return lfs.symlinkattributes(path, "mode")
 end
 
+function Update.has_backup(paths)
+    return mode(paths.backup) ~= nil
+end
+
 local function remove_tree(path)
     local kind = mode(path)
     if not kind then return true end
@@ -208,18 +220,32 @@ local function remove_tree(path)
     return os.remove(path)
 end
 
-function Update.clean_after_start(paths)
-    local stage_ok, stage_err = remove_tree(paths.work)
-    local backup_ok, backup_err = remove_tree(paths.backup)
-    if not stage_ok or not backup_ok then
-        logger.warn("单向历: 清理更新文件失败", tostring(stage_err or backup_err))
+local function sync_install_directory(paths)
+    local called, synced, err = pcall(ffiutil.fsyncDirectory, paths.parent)
+    if not called or not synced then
+        logger.warn("单向历: 刷新插件目录失败", tostring(called and err or synced))
+        return false
+    end
+    return true
+end
+
+function Update.clean_after_start(paths, healthy)
+    local ok, err = remove_tree(paths.work)
+    if not ok then logger.warn("单向历: 清理更新临时目录失败", tostring(err)) end
+    -- Keep the rollback copy until the new code has initialized its wallpaper
+    -- and the live directory entry has been confirmed on storage.
+    if healthy and Update.has_backup(paths) and mode(paths.live) == "directory"
+        and sync_install_directory(paths) then
+        ok, err = remove_tree(paths.backup)
+        if not ok then logger.warn("单向历: 清理更新备份失败", tostring(err)) end
     end
 end
 
 local stage_counter = 0
 
 function Update.make_stage(paths)
-    if mode(paths.live) ~= "directory" or mode(paths.backup) then return nil, "install_error" end
+    if mode(paths.live) ~= "directory" then return nil, "install_error" end
+    if Update.has_backup(paths) then return nil, "backup_pending" end
     if not mode(paths.work) and not lfs.mkdir(paths.work) then return nil, "write_error" end
     if mode(paths.work) ~= "directory" then return nil, "write_error" end
     -- An orphaned worker from the previous KOReader process cannot write to a
@@ -336,7 +362,7 @@ function Update.prepare(stage, release)
 end
 
 function Update.install(paths, stage)
-    if mode(paths.live) ~= "directory" or mode(paths.backup) or mode(stage .. "/new") ~= "directory" then
+    if mode(paths.live) ~= "directory" or Update.has_backup(paths) or mode(stage .. "/new") ~= "directory" then
         return "install_error"
     end
     local ok, err = os.rename(paths.live, paths.backup)
@@ -354,11 +380,7 @@ function Update.install(paths, stage)
         end
         return "install_error"
     end
-    local called, synced, sync_err = pcall(ffiutil.fsyncDirectory, paths.parent)
-    if not called or not synced then
-        logger.warn("单向历: 刷新插件目录失败", tostring(called and sync_err or synced))
-    end
-    return "installed"
+    return sync_install_directory(paths) and "installed" or "sync_error"
 end
 
 return Update

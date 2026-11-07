@@ -51,7 +51,9 @@
 - **在线更新（v1.5.0 起）**：连接 Wi-Fi，在「工具 → 单向历 → 检查插件更新」查看正式版。发现新版时点「下载安装」，完成后重启 KOReader。插件只在点击菜单时检查版本。
 - **USB 更新**：完全退出 KOReader，再用新版安装包中的 `danxiangli.koplugin` 文件夹覆盖旧插件目录，安全弹出 Kindle 后重新打开 KOReader。v1.4.0 及更早版本需用 USB 安装首个支持在线更新的版本。
 
-两种方式都会保留已有图片和 KOReader 中的插件设置。在线更新先核对安装包的 SHA-256 并检查文件，再替换插件目录。重启后新版成功初始化时会清理旧版备份。如果安装中断、重启后单向历菜单消失，可退出 KOReader 后通过 USB 恢复。打开 `koreader/plugins/`，如果已有 `danxiangli.koplugin` 目录，先将它移出，再把 `danxiangli.koplugin.previous` 改回 `danxiangli.koplugin`。
+两种方式都会保留已有图片和 KOReader 中的插件设置。在线更新先核对安装包的 SHA-256 并检查文件，再替换插件目录。如果设备未能确认磁盘写入，插件会提示并保留旧版备份。重启后，有缓存原图时会先用新版重新生成一次壁纸。壁纸初始化无错误且插件目录写入得到确认后，才会清理旧版备份。
+
+如果安装中断、重启后单向历菜单消失，可退出 KOReader 后通过 USB 恢复。打开 `koreader/plugins/`，如果已有 `danxiangli.koplugin` 目录，先将它移出，再把 `danxiangli.koplugin.previous` 改回 `danxiangli.koplugin`。
 
 KOReader 的插件目录通常位于 KOReader 安装目录下的 `plugins/` 文件夹。Kindle 上本插件使用上面的 `/mnt/us/koreader/plugins/` 路径。其他平台的安装说明可参照 [KOReader 用户指南](https://koreader.rocks/user_guide/)。
 
@@ -79,7 +81,7 @@ KOReader 的插件目录通常位于 KOReader 安装目录下的 `plugins/` 文�
 
 其中日期按北京时间计算。插件只会清理这个专用 `danxiangli/` 目录里的旧 JPG，不会扫描或清理 `screenshots/` 根目录以及其他目录中的图片。
 
-屏保读取 `danxiangli/wallpaper/` 中生成的 PNG。生成新壁纸成功后才替换上一张。发现 PNG 损坏时，会尝试用缓存的 JPG 离线重建。也可点「下载今日单向历」重新校验壁纸。原始 JPG 用于离线重建和切换样式。
+KOReader 从 `danxiangli/wallpaper/display/` 读取已验证的屏保图。插件在 `danxiangli/wallpaper/` 保留生成缓存，暂时无法验证的文件可以稍后重试。新屏保图通过验证后才替换上一张。发现 PNG 损坏时，会尝试用缓存的 JPG 离线重建。也可点「下载今日单向历」重新校验壁纸。原始 JPG 用于离线重建和切换样式。
 
 壁纸类型、自动屏保开关和原屏保设置备份保存在 KOReader 的设置中，不会另外创建插件设置文件。关闭“自动配置屏保”会恢复原来的屏保类型、图片目录、拉伸选项和屏保文字选项，并清除原设置备份。
 
@@ -108,7 +110,7 @@ KOReader 的插件目录通常位于 KOReader 安装目录下的 `plugins/` 文�
 
 - 当前代码面向 Kindle 版 KOReader；图片目录和设备支持声明均针对 Kindle。
 - 下载需要设备可以访问 OWSPACE 图片服务器。若图片地址改变、服务器未发布当天图片或网络不可用，插件无法保证当天图片可用；可以稍后重试或使用“诊断”查看状态。
-- 在线更新需要 Kindle 能访问 `api.github.com`、`github.com` 以及 GitHub 的发布附件下载域名。设备无法访问 GitHub 时可使用 USB 更新。
+- 在线更新需要 Kindle 直连 `api.github.com`、`github.com` 以及 GitHub 的发布附件下载域名。若启用了 KOReader 的 HTTP 代理，插件会提示可使用 USB 更新。
 - 单张原图的下载上限为 4 MiB，解码前还会检查尺寸（单边不超过 4096 像素，总面积不超过 4,194,304 像素）。
 - 单次下载设有 20 秒总时限，超时会终止后台任务并按退避间隔重试。切换阅读器界面或停用插件时会取消当前下载；待后台进程退出后清理临时文件，再允许新请求开始，已有有效图片会保留。
 - 自动配置屏保会修改 KOReader 的屏保选项。关闭该功能前不要手动清除设置备份；正常关闭开关会负责恢复原值。

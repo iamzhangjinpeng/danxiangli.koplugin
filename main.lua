@@ -41,6 +41,7 @@ local http404_cooldown_until
 local BASE_URL = "https://img.owspace.com/Public/uploads/Download/"
 local SAVE_DIR = "/mnt/us/koreader/screenshots/danxiangli/"
 local WALLPAPER_DIR = SAVE_DIR .. "wallpaper/"
+local WALLPAPER_DISPLAY_DIR = WALLPAPER_DIR .. "display/"
 
 -- 单向历按北京时间发布；固定偏移，不依赖设备时区
 local UTC_OFFSET = 8 * 3600
@@ -123,11 +124,17 @@ local function run_pending_work()
     run_pending_download_check()
 end
 
-local function show_update_recovery()
-    UIManager:show(InfoMessage:new{
-        text = gettext("旧版自动恢复失败，请通过 USB 将备份目录改回 danxiangli.koplugin：\n")
-            .. update_recovery_path,
-    })
+local function show_update_restart(message)
+    if update_needs_restart == "restore_error" then
+        UIManager:show(InfoMessage:new{
+            text = gettext("旧版自动恢复失败，请通过 USB 将备份目录改回 danxiangli.koplugin：\n")
+                .. update_recovery_path,
+        })
+    elseif update_needs_restart == "sync_error" then
+        UIManager:askForRestart(gettext("新版文件已替换，但磁盘写入未能确认。旧版备份已保留，请重启 KOReader 后检查。"))
+    else
+        UIManager:askForRestart(message or gettext("单向历已安装新版，重启 KOReader 后生效。"))
+    end
 end
 
 local function file_exists(path)
@@ -529,9 +536,26 @@ function DanXiangLi:init()
     self._last_status = nil
     if update_needs_restart then return end
 
-    util.makePath(WALLPAPER_DIR)
+    local inspect_update = self.path and not update_startup_checked
+    local Update, update_paths, verify_updated_wallpaper
+    if inspect_update then
+        local ok, updater, paths, has_backup = pcall(function()
+            local module = require("danxiangli_update")
+            local paths = module.paths(self.path)
+            return module, paths, paths and module.has_backup(paths)
+        end)
+        if ok then
+            Update, update_paths, verify_updated_wallpaper = updater, paths, has_backup
+        else
+            logger.warn("单向历: 检查更新备份失败", tostring(updater))
+        end
+    end
+
+    local wallpaper_dir_ready = util.makePath(WALLPAPER_DIR)
     cleanup_temporary_files()
-    self:_refresh_wallpaper()
+    -- When an update is pending verification, exercise the new renderer even
+    -- if the previous version left a valid PNG in the cache.
+    local _, wallpaper_error = self:_refresh_wallpaper(nil, verify_updated_wallpaper)
     if is_auto_screensaver_enabled() then
         self:_ensure_screensaver_settings()
     else
@@ -547,14 +571,12 @@ function DanXiangLi:init()
     self._retry_opts = nil
     self._loop_at = now + CHECK_INTERVAL
     self:_schedule_loop()
-    if not update_startup_checked and self.path then
+    if inspect_update then
         update_startup_checked = true
-        local ok, err = pcall(function()
-            local Update = require("danxiangli_update")
-            local paths = Update.paths(self.path)
-            if paths then Update.clean_after_start(paths) end
-        end)
-        if not ok then logger.warn("单向历: 清理更新文件失败", tostring(err)) end
+        if update_paths then
+            local ok, err = pcall(Update.clean_after_start, update_paths, wallpaper_dir_ready and not wallpaper_error)
+            if not ok then logger.warn("单向历: 清理更新文件失败", tostring(err)) end
+        end
     end
 end
 
@@ -636,10 +658,10 @@ function DanXiangLi:_refresh_wallpaper(source, refresh, verify_cache)
     local ok, available, failure, invalid_source = pcall(function()
         local Wallpaper = require("danxiangli_wallpaper")
         source = source or latest_cached_image()
-        return Wallpaper.prepare(WALLPAPER_DIR, source, wallpaper_style(), refresh, verify_cache)
+        return Wallpaper.prepare(WALLPAPER_DIR, source, wallpaper_style(), refresh, verify_cache, WALLPAPER_DISPLAY_DIR)
     end)
     if not ok then
-        failure, available = available, false
+        failure, available = available or "Wallpaper preparation failed", false
         logger.warn("单向历: 壁纸更新失败", tostring(failure))
     end
     self._undecodable_source = invalid_source and source or nil
@@ -690,8 +712,8 @@ function DanXiangLi:_ensure_screensaver_settings(force)
         G_reader_settings:saveSetting("screensaver_type", "random_image")
         changed = true
     end
-    if G_reader_settings:readSetting("screensaver_dir") ~= WALLPAPER_DIR then
-        G_reader_settings:saveSetting("screensaver_dir", WALLPAPER_DIR)
+    if G_reader_settings:readSetting("screensaver_dir") ~= WALLPAPER_DISPLAY_DIR then
+        G_reader_settings:saveSetting("screensaver_dir", WALLPAPER_DISPLAY_DIR)
         changed = true
     end
     -- 正确键名是 screensaver_stretch_images：不拉伸时图按比例缩放，
@@ -981,11 +1003,7 @@ end
 function DanXiangLi:download_today()
     if self._stopped then return end
     if update_needs_restart then
-        if update_recovery_path then
-            show_update_recovery()
-        else
-            UIManager:askForRestart(gettext("单向历已安装新版，重启 KOReader 后生效。"))
-        end
+        show_update_restart()
         return
     end
     self:_cancel_retry()
@@ -1003,11 +1021,13 @@ end
 local function update_error(status)
     if status == "missing_asset" then return gettext("正式版缺少安装 ZIP")
     elseif status == "bad_release" then return gettext("无法验证发布信息")
+    elseif status == "proxy_unsupported" then return gettext("KOReader 已启用 HTTP 代理，单向历在线更新需要直连 GitHub。可用 USB 更新。")
     elseif status == "redirect_error" then return gettext("下载跳转地址不受信任")
     elseif status == "too_large" then return gettext("更新数据超过大小上限")
     elseif status == "bad_digest" then return gettext("安装包校验失败")
     elseif status == "bad_zip" then return gettext("安装包内容无效")
     elseif status == "write_error" then return gettext("无法写入更新文件")
+    elseif status == "backup_pending" then return gettext("旧版备份仍在，请先确认当前版本运行正常，重启后再试。")
     elseif status == "install_error" then return gettext("替换失败，旧版已保留")
     end
     return status_text(status)
@@ -1044,17 +1064,17 @@ function DanXiangLi:_install_plugin_update(Update, paths, release)
         end, function(status, current)
             if current and status == "prepared" then
                 status = Update.install(paths, stage)
-                if status == "installed" or status == "restore_error" then
-                    update_needs_restart = true
+                if status == "installed" or status == "restore_error" or status == "sync_error" then
+                    update_needs_restart = status
                 end
                 if status == "restore_error" then update_recovery_path = paths.backup end
             end
             Update.remove_stage(paths, stage)
             if not current then return end
             if status == "installed" then
-                UIManager:askForRestart(gettext("单向历已安装 ") .. release.version .. gettext("，重启 KOReader 后生效。"))
-            elseif status == "restore_error" then
-                show_update_recovery()
+                show_update_restart(gettext("单向历已安装 ") .. release.version .. gettext("，重启 KOReader 后生效。"))
+            elseif update_needs_restart then
+                show_update_restart()
             else
                 update_message(gettext("安装失败：") .. update_error(status))
             end
@@ -1065,11 +1085,7 @@ end
 function DanXiangLi:_check_plugin_update()
     if self._stopped or active_instance ~= self then return end
     if update_needs_restart then
-        if update_recovery_path then
-            show_update_recovery()
-        else
-            UIManager:askForRestart(gettext("单向历的更新需要重启 KOReader。"))
-        end
+        show_update_restart()
         return
     end
     if self._update_busy or self._update_dialog then

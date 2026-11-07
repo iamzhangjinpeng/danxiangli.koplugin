@@ -183,7 +183,7 @@ local function fixture(options)
         ["ui/widget/infomessage"] = { new = function(_, t) return t end },
         ["ui/widget/confirmbox"] = { new = function(_, t) return t end },
         ["logger"] = { info = function() end, warn = function() end, dbg = function() end },
-        ["util"] = { makePath = function() end },
+        ["util"] = { makePath = function() return not options.make_path_fail end },
         ["socket.http"] = http,
         ["socketutil"] = socketutil,
         ["ffi/util"] = ffiutil,
@@ -193,8 +193,10 @@ local function fixture(options)
         ["danxiangli_wallpaper"] = {
             MAX_JPEG_BYTES = 4 * 1024 * 1024,
             validate_source = validate_source,
-            prepare = function(dir, source_path, style, refresh)
-                if options.prepare_wallpaper then return options.prepare_wallpaper(dir, source_path, style, refresh) end
+            prepare = function(dir, source_path, style, refresh, verify, display)
+                if options.prepare_wallpaper then
+                    return options.prepare_wallpaper(dir, source_path, style, refresh, verify, display)
+                end
                 if source_path and not validate_source(source_path) then return false, "decoder rejected file", true end
                 return false
             end,
@@ -515,7 +517,7 @@ test("switching wallpaper style uses the local JPEG and remembers the selection"
     eq(f.settings:readSetting("screensaver_dir"), nil)
     eq(f.count, 0)
     menu[1].callback()
-    eq(f.settings:readSetting("screensaver_dir"), latest.dir)
+    eq(f.settings:readSetting("screensaver_dir"), latest.dir .. "display/")
     f:new_instance()
     eq(latest.style, "card")
     eq(f.count, 0)
@@ -531,8 +533,28 @@ test("screensaver uses only generated wallpapers even when rendering fails", fun
     f.instance:addToMainMenu(items)
     f.settings:saveSetting("screensaver_dir", "/original/")
     items.danxiangli.sub_item_table[1].callback()
-    eq(f.settings:readSetting("screensaver_dir"), f.prefix .. "wallpaper/")
+    eq(f.settings:readSetting("screensaver_dir"), f.prefix .. "wallpaper/display/")
     f.instance:stopPlugin()
+    eq(f.settings:readSetting("screensaver_dir"), "/original/")
+    f:cleanup()
+end)
+
+test("upgrade switches the old screensaver directory without losing the original settings", function()
+    local cache_dir, display_dir
+    local f = fixture({ prepare_wallpaper = function(cache, _, _, _, _, display)
+        cache_dir, display_dir = cache, display
+        return true
+    end })
+    local items = {}
+    f.instance:addToMainMenu(items)
+    f.settings:saveSetting("screensaver_dir", "/original/")
+    items.danxiangli.sub_item_table[1].callback()
+    f.settings:saveSetting("screensaver_dir", f.prefix .. "wallpaper/")
+    local upgraded = f:new_instance()
+    eq(cache_dir, f.prefix .. "wallpaper/")
+    eq(display_dir, cache_dir .. "display/")
+    eq(f.settings:readSetting("screensaver_dir"), display_dir)
+    upgraded:stopPlugin()
     eq(f.settings:readSetting("screensaver_dir"), "/original/")
     f:cleanup()
 end)
@@ -622,18 +644,29 @@ test("UI transition defers temporary-file cleanup until old writer exits", funct
 end)
 
 local function update_fixture(options)
-    local counts = { checks = 0, prepared = 0, installed = 0, cleaned = 0, started = 0 }
+    local counts = { checks = 0, prepared = 0, installed = 0, cleaned = 0, started = 0, backups = 0 }
     options = options or {}
     options.update = {
         paths = function(path) return { live = path } end,
-        clean_after_start = function() counts.started = counts.started + 1 end,
-        check = function(version) eq(version, "1.5.0"); counts.checks = counts.checks + 1; return "available" end,
+        has_backup = function() return options.has_backup == true end,
+        clean_after_start = function(_, healthy)
+            counts.started = counts.started + 1
+            if healthy then counts.backups = counts.backups + 1 end
+        end,
+        check = function(version)
+            eq(version, "1.5.0")
+            counts.checks = counts.checks + 1
+            return options.check_status or "available"
+        end,
         parse_result = function(status)
             if status == "available" then return { version = "1.6.0", notes = "更新说明" } end
         end,
         make_stage = function() return "stage" end,
         prepare = function() counts.prepared = counts.prepared + 1; return "prepared" end,
-        install = function() counts.installed = counts.installed + 1; return "installed" end,
+        install = function()
+            counts.installed = counts.installed + 1
+            return options.install_status or "installed"
+        end,
         remove_stage = function() counts.cleaned = counts.cleaned + 1 end,
     }
     return fixture(options), counts
@@ -724,6 +757,85 @@ test("an unresponsive version check times out and releases the shared worker", f
     eq(f.messages[#f.messages], "检查更新失败：下载超时")
     eq(counts.installed, 0)
     f.instance:_check_plugin_update()
+    eq(f.count, 2)
+    f:cleanup()
+end)
+
+test("backup cleanup requires a healthy startup, including when no wallpaper is cached", function()
+    local f, counts = update_fixture({ today_image = jpeg,
+        prepare_wallpaper = function() error("missing runtime dependency") end })
+    eq(counts.started, 1, "stale staging still gets cleaned")
+    eq(counts.backups, 0)
+    f:cleanup()
+
+    f, counts = update_fixture({ make_path_fail = true })
+    eq(counts.backups, 0)
+    f:cleanup()
+
+    f, counts = update_fixture({ has_backup = true })
+    eq(counts.backups, 1, "no cache is valid when startup has no error")
+    f:cleanup()
+end)
+
+test("the first startup after an update exercises the renderer before clearing the backup", function()
+    local forced_renders = 0
+    local f, counts = update_fixture({ today_image = jpeg, has_backup = true,
+        prepare_wallpaper = function(_, source, _, refresh)
+            assert(source)
+            if refresh then
+                forced_renders = forced_renders + 1
+                return true, "generation failed while cached PNG was still usable"
+            end
+            return true
+        end })
+    eq(forced_renders, 1)
+    eq(counts.backups, 0, "a usable fallback must not hide the generation failure")
+    f:new_instance()
+    eq(forced_renders, 1, "opening a book must not repeat the update check")
+    eq(counts.backups, 0)
+    f:cleanup()
+
+    f, counts = update_fixture({ today_image = jpeg, has_backup = true,
+        prepare_wallpaper = function(_, source, _, refresh)
+            assert(source and refresh)
+            return true
+        end })
+    eq(counts.backups, 1)
+    f:cleanup()
+
+    f, counts = update_fixture({ today_image = jpeg,
+        prepare_wallpaper = function(_, source, _, refresh)
+            assert(source and not refresh, "ordinary startup should reuse cached wallpapers")
+            return true
+        end })
+    eq(counts.backups, 1)
+    f:cleanup()
+end)
+
+test("an enabled HTTP proxy has a specific update error", function()
+    local f = update_fixture({ today_image = jpeg, check_status = "proxy_unsupported" })
+    f.instance:_check_plugin_update()
+    f:complete(1)
+    f:advance(0.125)
+    assert(f.messages[#f.messages]:find("KOReader 已启用 HTTP 代理", 1, true))
+    eq(f.confirmation, nil)
+    f:cleanup()
+end)
+
+test("an unconfirmed install keeps its distinct restart warning across UI changes", function()
+    local f, counts = update_fixture({ today_image = jpeg, install_status = "sync_error" })
+    f.instance:_check_plugin_update()
+    f:complete(1)
+    f:advance(0.125)
+    f.confirmation.ok_callback()
+    f:complete(2)
+    f:advance(0.125)
+    assert(f.restart_message:find("磁盘写入未能确认", 1, true))
+    assert(f.restart_message:find("旧版备份已保留", 1, true))
+    f.restart_message = nil
+    f:new_instance():_check_plugin_update()
+    assert(f.restart_message:find("磁盘写入未能确认", 1, true))
+    eq(counts.started, 1)
     eq(f.count, 2)
     f:cleanup()
 end)
