@@ -6,6 +6,8 @@ ffi.cdef[[int getpid(void);]]
 local scratch = assert(arg[1], "Provide an existing scratch directory")
 local plugin = "danxiangli.koplugin"
 local url_prefix = "https://github.com/iamzhangjinpeng/" .. plugin .. "/releases/download/"
+local asset_api_prefix = "https://api.github.com/repos/iamzhangjinpeng/" .. plugin .. "/releases/assets/"
+local asset_id = 1234567890
 local digest = string.rep("a", 64)
 local data = "PK\3\4fixture ZIP"
 local cert_names, release, responses, entries
@@ -82,7 +84,8 @@ local function fixture_release(version)
     release = {
         tag_name = "v" .. version, draft = false, prerelease = false,
         body = string.rep("新", 200) .. "\n下一行",
-        assets = { { name = filename, state = "uploaded", digest = "sha256:" .. digest,
+        assets = { { name = filename, id = asset_id, url = asset_api_prefix .. asset_id,
+            state = "uploaded", digest = "sha256:" .. digest,
             size = #data, browser_download_url = url_prefix .. "v" .. version .. "/" .. filename } },
     }
     responses = { { code = 200 } }
@@ -106,9 +109,10 @@ end
 
 local function fixture_download()
     fixture_archive()
-    cert_names = { "github.com", "*.githubusercontent.com" }
+    cert_names = { "api.github.com", "*.githubusercontent.com" }
     responses = {
-        { code = 302, location = "https://release-assets.githubusercontent.com/object?key=value" },
+        { url = asset_api_prefix .. asset_id, code = 302,
+            location = "https://release-assets.githubusercontent.com/object?key=value" },
         { url = "https://release-assets.githubusercontent.com/object?key=value", body = data },
     }
 end
@@ -132,6 +136,7 @@ test("compares version segments numerically and limits the metadata passed to th
     eq(result.version, "1.10.0")
     eq(result.digest, digest)
     eq(result.size, #data)
+    eq(result.asset_id, tostring(asset_id))
     eq(result.notes, string.rep("新", 160) .. "…")
     fixture_release("1.10.0")
     release.body = "第一行\n第二行"
@@ -154,6 +159,12 @@ test("rejects drafts, malformed versions, missing assets, and invalid digests", 
     fixture_release("1.10.0")
     release.assets[1].digest = nil
     eq(Update.check("1.5.0"), "bad_release")
+    fixture_release("1.10.0")
+    release.assets[1].id = 1.5
+    eq(Update.check("1.5.0"), "bad_release")
+    fixture_release("1.10.0")
+    release.assets[1].url = asset_api_prefix .. "123"
+    eq(Update.check("1.5.0"), "bad_release")
 end)
 
 test("separates TLS and HTTP failure from an up-to-date result", function()
@@ -175,11 +186,11 @@ local function installed_fixture()
     assert(lfs.mkdir(paths.live))
     write(paths.live .. "/main.lua", "old version")
     local stage = assert(Update.make_stage(paths))
-    local candidate = { version = "1.10.0", size = #data, digest = digest }
+    local candidate = { version = "1.10.0", size = #data, digest = digest, asset_id = tostring(asset_id) }
     return paths, stage, candidate
 end
 
-test("clears KOReader's HTTP proxy for direct updater requests", function()
+test("clears the HTTP proxy and downloads release assets through the API", function()
     local http = require("socket.http")
     fixture_release("1.10.0")
     http.PROXY = "http://127.0.0.1:8080"
@@ -189,7 +200,7 @@ test("clears KOReader's HTTP proxy for direct updater requests", function()
     local paths, stage = installed_fixture()
     http.PROXY = "http://127.0.0.1:8080"
     fixture_download()
-    local candidate = { version = "1.10.0", size = #data, digest = digest }
+    local candidate = { version = "1.10.0", size = #data, digest = digest, asset_id = tostring(asset_id) }
     eq(Update.prepare(stage, candidate), "prepared")
     eq(http.PROXY, nil)
     Update.remove_stage(paths, stage)

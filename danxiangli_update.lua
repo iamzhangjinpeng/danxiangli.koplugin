@@ -7,13 +7,14 @@ local Update = {}
 local PLUGIN = "danxiangli.koplugin"
 local REPOSITORY = "iamzhangjinpeng/" .. PLUGIN
 local API = "https://api.github.com/repos/" .. REPOSITORY .. "/releases/latest"
+local API_ASSETS = "https://api.github.com/repos/" .. REPOSITORY .. "/releases/assets/"
 local DOWNLOAD = "https://github.com/" .. REPOSITORY .. "/releases/download/"
 local MAX_RESPONSE = 256 * 1024
 local MAX_ZIP = 1024 * 1024
 local MAX_EXPANDED = 4 * 1024 * 1024
 local MAX_ENTRIES = 96
 local ASSET_HOSTS = {
-    ["github.com"] = true,
+    ["api.github.com"] = true,
     ["release-assets.githubusercontent.com"] = true,
     ["objects.githubusercontent.com"] = true,
 }
@@ -41,8 +42,17 @@ local function asset_name(version)
     return PLUGIN .. "-v" .. version .. ".zip"
 end
 
-local function asset_url(version)
+local function browser_download_url(version)
     return DOWNLOAD .. "v" .. version .. "/" .. asset_name(version)
+end
+
+local function asset_url(id)
+    return API_ASSETS .. id
+end
+
+local function asset_id_string(id)
+    if type(id) ~= "number" or id < 1 or id >= 9007199254740992 or id % 1 ~= 0 then return end
+    return string.format("%.0f", id)
 end
 
 local function valid_digest(digest)
@@ -163,14 +173,16 @@ function Update.check(current_version)
     if type(release.assets) ~= "table" then return "missing_asset" end
     for _, asset in ipairs(release.assets) do
         if type(asset) == "table" and asset.name == asset_name(version) and asset.state == "uploaded"
-            and asset.browser_download_url == asset_url(version) then
+            and asset.browser_download_url == browser_download_url(version) then
+            local asset_id = asset_id_string(asset.id)
+            if not asset_id or asset.url ~= asset_url(asset_id) then return "bad_release" end
             local digest = type(asset.digest) == "string" and asset.digest:match("^sha256:(%x+)$")
             if not valid_digest(digest) then return "bad_release" end
             if type(asset.size) ~= "number" or asset.size < 1 or asset.size > MAX_ZIP
                 or asset.size % 1 ~= 0 then
                 return "too_large"
             end
-            return table.concat({ "available", version, tostring(asset.size), digest:lower(),
+            return table.concat({ "available", version, tostring(asset.size), digest:lower(), asset_id,
                 short_notes(release.body) }, "\n")
         end
     end
@@ -178,11 +190,13 @@ function Update.check(current_version)
 end
 
 function Update.parse_result(status)
-    local version, size, digest, notes =
-        status:match("^available\n([%d.]+)\n(%d+)\n(%x+)\n(.*)$")
+    local version, size, digest, asset_id, notes =
+        status:match("^available\n([%d.]+)\n(%d+)\n(%x+)\n(%d+)\n(.*)$")
     size = tonumber(size)
-    if version_parts(version) and size and size > 0 and size <= MAX_ZIP and valid_digest(digest) then
-        return { version = version, size = size, digest = digest, notes = notes }
+    local asset_id_number = tonumber(asset_id)
+    if version_parts(version) and size and size > 0 and size <= MAX_ZIP and valid_digest(digest)
+        and asset_id_number and asset_id == asset_id_string(asset_id_number) then
+        return { version = version, size = size, digest = digest, asset_id = asset_id, notes = notes }
     end
 end
 
@@ -347,7 +361,7 @@ local function extract(reader, destination, version)
 end
 
 function Update.prepare(stage, release)
-    local data, err = get(asset_url(release.version), release.size, true)
+    local data, err = get(asset_url(release.asset_id), release.size, true)
     if not data then return err end
     if #data ~= release.size or require("ffi/sha2").sha256(data) ~= release.digest then
         return "bad_digest"
